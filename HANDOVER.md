@@ -5,7 +5,7 @@
 
 ## 这是什么
 
-用户自研的 Chrome 扩展（Manifest V3，纯 JavaScript，**没有构建步骤**），用途：在 Mercari、ラクマ（Rakuma）、PayPayフリマ、Yahoo! Auctions 四个平台之间互相复制出品（读取商品页 → 到目标平台出品页自动填表）。当前版本 **0.10.5**（以 manifest.json 的 version 为准，每次发布递增）。
+用户自研的 Chrome 扩展（Manifest V3，纯 JavaScript，**没有构建步骤**），用途：在 Mercari、ラクマ（Rakuma）、PayPayフリマ、Yahoo! Auctions 四个平台之间互相复制出品（读取商品页 → 到目标平台出品页自动填表）。当前版本 **0.10.9**（以 manifest.json 的 version 为准，每次发布递增）。
 
 用户以「加载已解压的扩展程序」方式安装。**更新流程是手动的**：覆盖扩展文件夹 → 在 chrome://extensions 点重新加载（↻）。已打开的标签页仍跑旧的内容脚本，必须刷新页面才生效——排查「改了没效果」时先想到这条。
 
@@ -14,12 +14,12 @@
 | 文件 | 职责 |
 |---|---|
 | `manifest.json` | 权限与内容脚本注入表。host_permissions 含 `http://127.0.0.1/*`（与管理程序联动用） |
-| `background.js` | Service Worker。三大块：① GitHub Gist 远程指令轮询（约每分钟，chrome.alarms）；② 本地管理程序任务轮询与执行；③ Mercari 图片重抓（在后台标签页打开源页面重新捕获） |
+| `background.js` | Service Worker：GitHub Gist 指令轮询、本地管理程序任务轮询、可配置的 Mercari Todo 定时扫描、图片重抓，以及 Yahoo 未落札商品全分页再出品 |
 | `lib/store.js` | `window.FurimaCopy`：暂存数据（chrome.storage.local 的 `copyData` / `copyImages`）、商品页的「📋 この商品をコピー」按钮与悬停菜单、各平台出品页 URL（SELL_URLS）、复制时抓取图片字节 |
 | `lib/fill.js` | `window.FurimaFill`：React 安全赋值（setNativeValue）、按标签/占位符找字段、图片附件、结果面板 `showPanel`、自动填充监视器（autoTarget，带页面稳定判定）、页面状态快照下载（诊断用） |
 | `readers/*.js` | 四个平台商品页的读取器，各自输出统一的暂存数据结构 |
 | `fillers/sell-*.js` | 四个平台出品页的填充器，读暂存数据填表并逐项验证 |
-| `popup.html` / `popup.js` | 设置：Gist 远程指令（remoteConfig）、管理程序联动（managerConfig：开关 + token） |
+| `popup.html` / `popup.js` | 设置：Gist 远程指令、管理程序联动，以及 Todo 扫描开关与分钟/小时间隔 |
 
 暂存数据（copyData）主要字段：title / description / price / categoryText / conditionText / imageUrls / sourceUrl / sourcePlatform，以及联动用的 inventoryCode（管理程序的商品番号）和 managerTask 标记。
 

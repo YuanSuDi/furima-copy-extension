@@ -411,10 +411,14 @@ async function recaptureImages(itemUrl) {
 // ============================================================================
 
 const MANAGER_ALARM = "fcManagerPoll";
+const TODO_SCAN_ALARM = "fcMercariTodoScan";
 const MANAGER_DEFAULTS = {
   enabled: false,
   baseUrl: "http://127.0.0.1:17341",
   token: "",
+  todoScanEnabled: false,
+  todoScanInterval: 5,
+  todoScanUnit: "minutes",
   lastPollAt: null,
   lastStatus: "未設定",
   lastSaleScanAt: null,
@@ -452,9 +456,11 @@ async function managerFetch(cfg, path, init) {
   return res.json();
 }
 
-async function scanMercariSoldTodos(cfg) {
-  if (!cfg.enabled || soldScanRunning) return;
+async function scanMercariSoldTodos(cfg, force) {
+  if (!cfg.todoScanEnabled && !force) return { ok: true, skipped: true };
+  if (soldScanRunning) return { ok: false, error: "Todo 扫描正在进行中" };
   soldScanRunning = true;
+  const stopKeepAlive = startKeepAlive();
   let todosTab = null;
   let cards = [];
   let matched = 0;
@@ -477,21 +483,24 @@ async function scanMercariSoldTodos(cfg) {
 
       if (!itemId && /^https:\/\/jp\.mercari\.com\/transactions?\//.test(card.url)) {
         const detailTab = await chrome.tabs.create({ url: card.url, active: false });
-        await waitForTabComplete(detailTab.id, 45000);
-        await remoteSleep(2500);
-        const detail = await sendToTabWithRetry(
-          detailTab.id,
-          { type: "FurimaScanSoldTodos" },
-          10,
-          2000
-        );
-        if (detail && detail.detail) {
-          itemId = detail.detail.itemId;
-          listingUrl = detail.detail.url;
-        }
         try {
-          await chrome.tabs.remove(detailTab.id);
-        } catch (e) {}
+          await waitForTabComplete(detailTab.id, 45000);
+          await remoteSleep(2500);
+          const detail = await sendToTabWithRetry(
+            detailTab.id,
+            { type: "FurimaScanSoldTodos" },
+            10,
+            2000
+          );
+          if (detail && detail.detail) {
+            itemId = detail.detail.itemId;
+            listingUrl = detail.detail.url;
+          }
+        } finally {
+          try {
+            await chrome.tabs.remove(detailTab.id);
+          } catch (e) {}
+        }
       }
 
       if (!itemId) {
@@ -517,12 +526,14 @@ async function scanMercariSoldTodos(cfg) {
         "発送待ち " + cards.length + "件 / 在庫連携 " + matched +
         "件 / 商品未一致 " + unmatched + "件",
     });
+    return { ok: true };
   } catch (e) {
     console.warn("[FurimaCopy] sold todos scan failed", e);
     await setManagerConfig({
       lastSaleScanAt: new Date().toISOString(),
       lastSaleScanStatus: "スキャン失敗: " + String((e && e.message) || e),
     });
+    return { ok: false, error: String((e && e.message) || e) };
   } finally {
     if (todosTab) {
       try {
@@ -530,13 +541,13 @@ async function scanMercariSoldTodos(cfg) {
       } catch (e) {}
     }
     soldScanRunning = false;
+    stopKeepAlive();
   }
 }
 
 async function pollManagerTasks(why) {
   const cfg = await getManagerConfig();
   if (!cfg.enabled || managerRunning) return;
-  await scanMercariSoldTodos(cfg);
   let data;
   try {
     data = await managerFetch(cfg, "/api/tasks?status=pending");
@@ -824,17 +835,85 @@ async function executeManagerTask(cfg, task) {
 }
 
 chrome.alarms.create(MANAGER_ALARM, { periodInMinutes: 1 });
+function todoScanPeriodInMinutes(config) {
+  const interval = Number(config.todoScanInterval);
+  const unit = config.todoScanUnit;
+  if (!Number.isInteger(interval) || interval < 1) {
+    throw new Error("Todo 扫描间隔必须是正整数");
+  }
+  if (unit === "minutes" && interval <= 1440) return interval;
+  if (unit === "hours" && interval <= 24) return interval * 60;
+  throw new Error("Todo 扫描间隔无效：分钟最多 1440，小时最多 24");
+}
+
+async function updateTodoScanAlarm(config) {
+  if (!config.todoScanEnabled) {
+    await chrome.alarms.clear(TODO_SCAN_ALARM);
+    return;
+  }
+  chrome.alarms.create(TODO_SCAN_ALARM, {
+    periodInMinutes: todoScanPeriodInMinutes(config),
+  });
+}
+
+function restoreTodoScanAlarm() {
+  getManagerConfig()
+    .then(updateTodoScanAlarm)
+    .catch((error) => console.error("[FurimaCopy] failed to restore Todo scan schedule", error));
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(MANAGER_ALARM, { periodInMinutes: 1 });
+  restoreTodoScanAlarm();
 });
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(MANAGER_ALARM, { periodInMinutes: 1 });
+  restoreTodoScanAlarm();
   pollManagerTasks("startup");
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === MANAGER_ALARM) pollManagerTasks("alarm");
+  if (alarm.name === TODO_SCAN_ALARM) {
+    getManagerConfig()
+      .then((config) => scanMercariSoldTodos(config))
+      .catch((error) => console.error("[FurimaCopy] scheduled Todo scan failed", error));
+  }
 });
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "FurimaManagerSaveConfig") {
+    (async () => {
+      const interval = Number(msg.todoScanInterval);
+      const unit = msg.todoScanUnit;
+      const todoScanEnabled = !!msg.todoScanEnabled;
+      todoScanPeriodInMinutes({
+        todoScanInterval: interval,
+        todoScanUnit: unit,
+      });
+      const config = await setManagerConfig({
+        enabled: !!msg.enabled,
+        baseUrl: String(msg.baseUrl || "").trim() || "http://127.0.0.1:17341",
+        token: String(msg.token || "").trim(),
+        todoScanEnabled,
+        todoScanInterval: interval,
+        todoScanUnit: unit,
+      });
+      await updateTodoScanAlarm(config);
+      sendResponse({ ok: true });
+    })().catch((error) => {
+      sendResponse({ ok: false, error: String((error && error.message) || error) });
+    });
+    return true;
+  }
+  if (msg && msg.type === "FurimaTodoScanNow") {
+    getManagerConfig()
+      .then((config) => scanMercariSoldTodos(config, true))
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: String((error && error.message) || error),
+      }));
+    return true;
+  }
   if (msg && msg.type === "FurimaManagerPollNow") {
     pollManagerTasks("manual").then(() => sendResponse({ ok: true }));
     return true;
@@ -842,9 +921,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return false;
 });
 
-// Yahoo! オークション「落札者なし」一覧から、現在ページだけを順番に再出品する。
+// Yahoo! オークション「落札者なし」一覧を全ページ確認し、順番に再出品する。
 const YAHOO_RELIST_STATE_KEY = "yahooRelistState";
-const YAHOO_RELIST_MAX_ITEMS = 100;
+const YAHOO_RELIST_MAX_ITEMS = 1000;
 let yahooRelistRun = null;
 
 function isYahooClosedNoWinnerUrl(value) {
@@ -860,21 +939,19 @@ function isYahooClosedNoWinnerUrl(value) {
   }
 }
 
-async function scanYahooClosedTab(tabId) {
-  const tab = await chrome.tabs.get(tabId);
-  if (!isYahooClosedNoWinnerUrl(tab.url || "")) {
-    throw new Error("「落札者なし」（hasWinner=0）の出品終了分ページを開いてください");
-  }
+async function scanYahooClosedPage(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
-      if (location.origin !== "https://auctions.yahoo.co.jp" ||
-          location.pathname !== "/my/closed" ||
-          new URL(location.href).searchParams.get("hasWinner") !== "0") {
+      const currentUrl = new URL(location.href);
+      if (
+        currentUrl.origin !== "https://auctions.yahoo.co.jp" ||
+        currentUrl.pathname !== "/my/closed" ||
+        currentUrl.searchParams.get("hasWinner") !== "0"
+      ) {
         return { ok: false, error: "対象ページが「落札者なし」ではありません" };
       }
-      const list = document.getElementById("itm");
-      if (!list) return { ok: false, error: "商品一覧を確認できませんでした" };
+      const list = document.getElementById("itm") || document;
       const items = [];
       const seen = new Set();
       for (const link of list.querySelectorAll('a[href*="/sell/jp/show/resubmit"]')) {
@@ -896,7 +973,7 @@ async function scanYahooClosedTab(tabId) {
         }
         if (seen.has(id)) continue;
         seen.add(id);
-        const row = link.closest("tr") || link.parentElement;
+        const row = link.closest("tr, [role='row'], li") || link.parentElement;
         items.push({
           id,
           title: (row && row.textContent ? row.textContent : link.textContent || "")
@@ -905,17 +982,150 @@ async function scanYahooClosedTab(tabId) {
             .slice(0, 120),
         });
       }
-      return { ok: true, items };
+
+      const links = Array.from(document.querySelectorAll("a[href]"));
+      const isClosedListPageLink = (link) => {
+        try {
+          const url = new URL(link.href, location.href);
+          return (
+            url.origin === currentUrl.origin &&
+            url.pathname === currentUrl.pathname &&
+            url.searchParams.get("hasWinner") === "0" &&
+            url.href !== currentUrl.href
+          );
+        } catch (e) {
+          return false;
+        }
+      };
+      const findPageLink = (pattern) => links.find((link) => {
+        if (!isClosedListPageLink(link)) return false;
+        const label = [
+          link.innerText,
+          link.getAttribute("aria-label"),
+          link.getAttribute("title"),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        return pattern.test(label);
+      });
+      const findRelPageLink = (rel) =>
+        links.find(
+          (link) =>
+            isClosedListPageLink(link) && link.rel.split(/\s+/).includes(rel)
+        );
+      const parsePageUrl = (link) => {
+        if (!link) return null;
+        const parsedNext = new URL(link.href, location.href);
+        if (
+          parsedNext.origin === currentUrl.origin &&
+          parsedNext.pathname === currentUrl.pathname &&
+          parsedNext.searchParams.get("hasWinner") === "0" &&
+          parsedNext.href !== currentUrl.href
+        ) {
+          return parsedNext.href;
+        }
+        return null;
+      };
+      const nextUrl = parsePageUrl(
+        findRelPageLink("next") ||
+          findPageLink(/^(次へ|次のページ|次ページ|次の\d+件|›|»|>)(?:\s|[（(]|$)/)
+      );
+      const previousUrl = parsePageUrl(
+        findRelPageLink("prev") ||
+          findPageLink(/^(前へ|前のページ|前ページ|前の\d+件|‹|«|<)(?:\s|[（(]|$)/)
+      );
+      return { ok: true, items, nextUrl, previousUrl };
     },
   });
   const scan = results[0] && results[0].result;
   if (!scan || !scan.ok) {
     throw new Error((scan && scan.error) || "商品一覧を読み取れませんでした");
   }
-  if (scan.items.length > YAHOO_RELIST_MAX_ITEMS) {
-    throw new Error("現在ページの商品が多すぎます。表示件数を減らしてから実行してください");
+  return scan;
+}
+
+async function scanYahooClosedTab(tabId) {
+  const sourceTab = await chrome.tabs.get(tabId);
+  if (!isYahooClosedNoWinnerUrl(sourceTab.url || "")) {
+    throw new Error("「落札者なし」（hasWinner=0）の出品終了分ページを開いてください");
   }
-  return scan.items;
+  const scanTab = await chrome.tabs.create({ url: sourceTab.url, active: false });
+  const items = [];
+  const seenItems = new Set();
+  const seenPages = new Set();
+  const pagesBackToFirst = [];
+  const addItems = (page) => {
+    for (const item of page.items) {
+      if (seenItems.has(item.id)) continue;
+      seenItems.add(item.id);
+      items.push(item);
+      if (items.length > YAHOO_RELIST_MAX_ITEMS) {
+        throw new Error("対象が多すぎます。表示件数を減らしてから実行してください");
+      }
+    }
+  };
+  try {
+    if (!(await waitForTabComplete(scanTab.id, 45000))) {
+      throw new Error("商品一覧ページの読み込みがタイムアウトしました");
+    }
+
+    const backwardPages = new Set();
+    for (let pageNumber = 0; pageNumber < 100; pageNumber++) {
+      const currentTab = await chrome.tabs.get(scanTab.id);
+      const currentUrl = currentTab.url || "";
+      if (backwardPages.has(currentUrl)) {
+        throw new Error("商品一覧の前ページ移動でループを検出しました");
+      }
+      backwardPages.add(currentUrl);
+      const page = await scanYahooClosedPage(scanTab.id);
+      pagesBackToFirst.push(page);
+      if (!page.previousUrl) break;
+      await chrome.tabs.update(scanTab.id, { url: page.previousUrl });
+      if (!(await waitForTabComplete(scanTab.id, 45000))) {
+        throw new Error("前の商品一覧ページの読み込みがタイムアウトしました");
+      }
+      await remoteSleep(500);
+      if (pageNumber === 99) {
+        throw new Error("商品一覧のページ数が上限を超えました");
+      }
+    }
+    backwardPages.forEach((url) => seenPages.add(url));
+
+    for (let index = pagesBackToFirst.length - 1; index >= 0; index--) {
+      addItems(pagesBackToFirst[index]);
+    }
+
+    let nextUrl = pagesBackToFirst[0] && pagesBackToFirst[0].nextUrl;
+    for (let pageNumber = 0; nextUrl; pageNumber++) {
+      if (pageNumber >= 100 || seenPages.size >= 100) {
+        throw new Error("商品一覧のページ数が上限を超えました");
+      }
+      await chrome.tabs.update(scanTab.id, { url: nextUrl });
+      if (!(await waitForTabComplete(scanTab.id, 45000))) {
+        throw new Error("次の商品一覧ページの読み込みがタイムアウトしました");
+      }
+      await remoteSleep(700);
+      const currentTab = await chrome.tabs.get(scanTab.id);
+      const currentUrl = currentTab.url || "";
+      if (seenPages.has(currentUrl)) {
+        throw new Error("商品一覧のページ移動でループを検出しました");
+      }
+      seenPages.add(currentUrl);
+
+      const page = await scanYahooClosedPage(scanTab.id);
+      addItems(page);
+      nextUrl = page.nextUrl;
+    }
+    return items;
+  } finally {
+    try {
+      await chrome.tabs.remove(scanTab.id);
+    } catch (e) {
+      /* Scan tab may already be closed. */
+    }
+  }
 }
 
 async function setYahooRelistState(state) {
@@ -996,11 +1206,12 @@ async function inspectAndAdvanceYahooRelist(
         "出品する",
         "再出品する",
       ]);
-      const scope = isPreviewPage
-        ? document.querySelector("main") || document.querySelector('[role="main"]') || document.body
-        : document.querySelector("form");
+      const scope =
+        document.querySelector("main") ||
+        document.querySelector('[role="main"]') ||
+        document.body;
       if (!scope) {
-        return { status: "error", error: "再出品フォームを特定できませんでした" };
+        return { status: "pending" };
       }
       const controls = Array.from(
         scope.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]')
@@ -1029,7 +1240,9 @@ async function inspectAndAdvanceYahooRelist(
           status: "error",
           error: matches.length
             ? "出品操作ボタンを一意に特定できませんでした"
-            : "安全に押せる再出品ボタンが見つかりませんでした",
+            : "安全に押せる再出品ボタンが見つかりませんでした（可见操作：" +
+              controls.map(({ label }) => label).filter(Boolean).slice(0, 8).join(" / ") +
+              "）",
         };
       }
       const match = matches[0];

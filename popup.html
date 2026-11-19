@@ -52,7 +52,7 @@
   h2 { font-size: 13px; margin: 0 0 8px; }
   .row { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
   .row label { font-size: 12px; }
-  input[type="text"], input[type="url"] {
+  input[type="text"], input[type="url"], input[type="number"], select {
     width: 100%;
     box-sizing: border-box;
     padding: 6px 8px;
@@ -61,6 +61,8 @@
     border-radius: 6px;
     margin: 4px 0;
   }
+  input[type="number"] { width: 74px; }
+  select { width: auto; }
   .btn {
     padding: 7px 10px;
     font-size: 12px;
@@ -136,6 +138,27 @@
   </div>
   <div id="mgrStatus"></div>
   <p class="note">※ PC の出品管理プログラムが作った自動出品タスクを実行します。出品まで自動で進めるのは、管理プログラムから来たタスクだけです（通常のコピー＆入力は従来どおり送信しません）。</p>
+  <hr>
+  <h2>Mercari Todo 扫描</h2>
+  <div class="row">
+    <input type="checkbox" id="todoScanEnabled">
+    <label for="todoScanEnabled">定时扫描 Todo 并同步售出状态</label>
+  </div>
+  <div class="row">
+    <label for="todoScanInterval">扫描间隔</label>
+    <input type="number" id="todoScanInterval" min="1" max="1440" step="1" value="5">
+    <select id="todoScanUnit">
+      <option value="minutes">分钟</option>
+      <option value="hours">小时</option>
+    </select>
+  </div>
+  <div class="row">
+    <button class="btn" id="todoScanNow" type="button">立即扫描 Todo</button>
+  </div>
+  <div class="row">
+    <button class="btn" id="todoScanSave" type="button">保存 Todo 扫描设置</button>
+  </div>
+  <p class="note">※ Todo 的定时扫描由上方开关控制；需要商品管理桌面程序正在运行，且连接地址和令牌已配置。</p>
 
   <script src="lib/store.js"></script>
   <script src="popup.js"></script>

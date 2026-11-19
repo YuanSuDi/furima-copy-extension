@@ -5,14 +5,22 @@
   if (window.__fcYahooClosedRelistUiInstalled) return;
   window.__fcYahooClosedRelistUiInstalled = true;
 
-  const TARGET_URL = "https://auctions.yahoo.co.jp/my/closed?hasWinner=0";
   const STATE_KEY = "yahooRelistState";
   let ui = null;
   let previewItems = null;
   let stopRequested = false;
 
   function isTargetPage() {
-    return location.href === TARGET_URL;
+    try {
+      const url = new URL(location.href);
+      return (
+        url.origin === "https://auctions.yahoo.co.jp" &&
+        url.pathname === "/my/closed" &&
+        url.searchParams.get("hasWinner") === "0"
+      );
+    } catch (e) {
+      return false;
+    }
   }
 
   function renderStoredState(state) {
@@ -65,7 +73,7 @@
       currentUi.confirmRow.hidden = false;
       currentUi.start.hidden = false;
       currentUi.start.textContent = result.items.length + " 件を自動で再出品";
-      currentUi.status.textContent = "対象を確認し、チェックを入れて開始してください";
+      currentUi.status.textContent = "全ページの対象を確認し、チェックを入れて開始してください";
       currentUi.start.disabled = true;
     } catch (e) {
       if (ui === currentUi) {
@@ -181,7 +189,7 @@
       </style>
       <section class="card">
         <h2>Yahoo!オークション 未落札商品の再出品</h2>
-        <p>このページに表示された未落札商品だけを対象にします。開始後は各商品の確認ページまで進み、自動で出品します。</p>
+        <p>未落札商品の一覧を全ページ確認します。開始後は各商品の確認ページまで進み、自動で再出品します。</p>
         <button id="previewButton" type="button">Yahoo!オークション 未落札商品の再出品</button>
         <div id="preview"></div>
         <div id="confirmRow" hidden>

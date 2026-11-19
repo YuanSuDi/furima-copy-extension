@@ -133,6 +133,9 @@
     baseUrl: document.getElementById("mgrBaseUrl"),
     token: document.getElementById("mgrToken"),
     status: document.getElementById("mgrStatus"),
+    todoScanEnabled: document.getElementById("todoScanEnabled"),
+    todoScanInterval: document.getElementById("todoScanInterval"),
+    todoScanUnit: document.getElementById("todoScanUnit"),
   };
 
   async function renderManager() {
@@ -145,8 +148,23 @@
     if (document.activeElement !== mgrEls.token) {
       mgrEls.token.value = cfg.token || "";
     }
+    mgrEls.todoScanEnabled.checked = !!cfg.todoScanEnabled;
+    if (document.activeElement !== mgrEls.todoScanInterval) {
+      mgrEls.todoScanInterval.value = cfg.todoScanInterval || 5;
+    }
+    if (document.activeElement !== mgrEls.todoScanUnit) {
+      mgrEls.todoScanUnit.value = cfg.todoScanUnit || "minutes";
+    }
+    mgrEls.todoScanInterval.max = mgrEls.todoScanUnit.value === "hours" ? 24 : 1440;
     const lines = [];
     lines.push("状態: " + (cfg.lastStatus || "未設定"));
+    lines.push(
+      "Todo 定时扫描: " +
+        (cfg.todoScanEnabled
+          ? "已开启（每 " + (cfg.todoScanInterval || 5) +
+            (cfg.todoScanUnit === "hours" ? " 小时）" : " 分钟）")
+          : "已关闭")
+    );
     lines.push("卖出监测: " + (cfg.lastSaleScanStatus || "未扫描"));
     if (cfg.lastSaleScanAt) {
       lines.push("卖出监测时间: " + new Date(cfg.lastSaleScanAt).toLocaleString("zh-CN"));
@@ -157,15 +175,41 @@
     mgrEls.status.textContent = lines.join("\n");
   }
 
-  document.getElementById("mgrSave").addEventListener("click", async () => {
-    const res = await chrome.storage.local.get("managerConfig");
-    const cfg = Object.assign({}, res.managerConfig || {}, {
-      enabled: mgrEls.enabled.checked,
-      baseUrl: mgrEls.baseUrl.value.trim() || "http://127.0.0.1:17341",
-      token: mgrEls.token.value.trim(),
-    });
-    await chrome.storage.local.set({ managerConfig: cfg });
-    renderManager();
+  const saveManagerConfig = async () => {
+    const interval = Number(mgrEls.todoScanInterval.value);
+    const unit = mgrEls.todoScanUnit.value;
+    const max = unit === "hours" ? 24 : 1440;
+    if (!Number.isInteger(interval) || interval < 1 || interval > max) {
+      mgrEls.status.textContent =
+        "保存失败：扫描间隔必须是 1 到 " + max + (unit === "hours" ? " 小时" : " 分钟");
+      return;
+    }
+    mgrEls.status.textContent = "正在保存设置…";
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: "FurimaManagerSaveConfig",
+        enabled: mgrEls.enabled.checked,
+        baseUrl: mgrEls.baseUrl.value.trim(),
+        token: mgrEls.token.value.trim(),
+        todoScanEnabled: mgrEls.todoScanEnabled.checked,
+        todoScanInterval: interval,
+        todoScanUnit: unit,
+      });
+      if (!result || !result.ok) {
+        mgrEls.status.textContent =
+          "保存失败：" + ((result && result.error) || "后台未能更新扫描计划");
+        return;
+      }
+      await renderManager();
+    } catch (error) {
+      mgrEls.status.textContent =
+        "保存失败：" + String((error && error.message) || error);
+    }
+  };
+  document.getElementById("mgrSave").addEventListener("click", saveManagerConfig);
+  document.getElementById("todoScanSave").addEventListener("click", saveManagerConfig);
+  mgrEls.todoScanUnit.addEventListener("change", () => {
+    mgrEls.todoScanInterval.max = mgrEls.todoScanUnit.value === "hours" ? 24 : 1440;
   });
 
   document.getElementById("mgrPollNow").addEventListener("click", () => {
@@ -173,6 +217,20 @@
     chrome.runtime.sendMessage({ type: "FurimaManagerPollNow" }, () => {
       setTimeout(renderManager, 1200);
     });
+  });
+
+  document.getElementById("todoScanNow").addEventListener("click", async () => {
+    mgrEls.status.textContent = "Todo 扫描中…";
+    try {
+      const result = await chrome.runtime.sendMessage({ type: "FurimaTodoScanNow" });
+      await renderManager();
+      if (result && !result.ok && !result.skipped) {
+        mgrEls.status.textContent += "\n立即扫描失败：" + (result.error || "未知错误");
+      }
+    } catch (error) {
+      mgrEls.status.textContent =
+        "立即扫描失败：" + String((error && error.message) || error);
+    }
   });
 
   render();
