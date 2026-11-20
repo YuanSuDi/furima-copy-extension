@@ -76,6 +76,7 @@
   .btn:hover { background: #e6e6e6; }
   #remoteStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
   #mgrStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
+  #yahooScanStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
   input[type="password"] {
     width: 100%;
     box-sizing: border-box;
@@ -159,6 +160,29 @@
     <button class="btn" id="todoScanSave" type="button">保存 Todo 扫描设置</button>
   </div>
   <p class="note">※ Todo 的定时扫描由上方开关控制；需要商品管理桌面程序正在运行，且连接地址和令牌已配置。</p>
+
+  <hr>
+  <h2>Yahoo!オークション 売却扫描</h2>
+  <div class="row">
+    <input type="checkbox" id="yahooScanEnabled">
+    <label for="yahooScanEnabled">定时扫描落札済み并同步售出状态</label>
+  </div>
+  <div class="row">
+    <label for="yahooScanInterval">扫描间隔</label>
+    <input type="number" id="yahooScanInterval" min="1" max="1440" step="1" value="5">
+    <select id="yahooScanUnit">
+      <option value="minutes">分钟</option>
+      <option value="hours">小时</option>
+    </select>
+  </div>
+  <div class="row">
+    <button class="btn" id="yahooScanNow" type="button">立即扫描 Yahoo</button>
+  </div>
+  <div class="row">
+    <button class="btn" id="yahooScanSave" type="button">保存 Yahoo 扫描设置</button>
+  </div>
+  <div id="yahooScanStatus"></div>
+  <p class="note">※ 只上报「発送をしてください」（已付款待发货）的商品；需要桌面程序 v0.1.7 以上且已为商品绑定雅虎参照。</p>
 
   <script src="lib/store.js"></script>
   <script src="popup.js"></script>
