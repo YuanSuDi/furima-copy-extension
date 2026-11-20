@@ -697,6 +697,49 @@ async function probeMercariOwnership(tabId) {
   return last;
 }
 
+// Yahoo 商品ページで「自分の商品か」を判定する（所有権確認用）。
+// 出品中のオークションでは再出品ページが使えないため、商品ページ自体に
+// 出品者だけが見える「オークションの編集」があるかを見る（fail-closed）。
+async function probeYahooAuctionOwnership(tabId) {
+  let last = { isOwner: false, sellerSignals: [] };
+  for (let i = 0; i < 4; i++) {
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return (
+              s.display !== "none" &&
+              s.visibility !== "hidden" &&
+              el.getClientRects().length > 0
+            );
+          };
+          const texts = Array.from(
+            document.querySelectorAll('a, button, [role="button"]')
+          )
+            .filter(visible)
+            .map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim())
+            .filter(Boolean);
+          const sellerSignals = texts.filter((t) =>
+            /オークションの編集|出品の編集|この出品を編集/.test(t)
+          );
+          return {
+            isOwner: sellerSignals.length > 0,
+            sellerSignals: sellerSignals.slice(0, 3),
+          };
+        },
+      });
+      if (results[0] && results[0].result) last = results[0].result;
+      if (last.isOwner) return last;
+    } catch (e) {
+      /* ページ準備中なら少し待って再試行する */
+    }
+    await remoteSleep(2000);
+  }
+  return last;
+}
+
 // Yahoo 再出品ページが操作可能か（＝自分の商品か）を、クリックせずに判定する。
 async function probeYahooResubmit(tabId, itemId) {
   try {
@@ -768,17 +811,33 @@ async function executeVerifyTask(cfg, task) {
         String(task.itemUrl || "").match(/^([a-zA-Z]?\d+)$/);
       listingId = m && m[1];
       if (!listingId) throw new Error("オークション ID を特定できませんでした");
-      const tab = await chrome.tabs.create({
-        url:
-          "https://auctions.yahoo.co.jp/sell/jp/show/resubmit?aID=" +
-          encodeURIComponent(listingId),
-        active: false,
-      });
+      const tab = await chrome.tabs.create({ url: task.itemUrl, active: false });
       tabId = tab.id;
       await waitForTabComplete(tabId, 45000);
-      await remoteSleep(1800);
-      const probe = await probeYahooResubmit(tabId, listingId);
-      isOwner = !!(probe && probe.operable);
+      await remoteSleep(2500);
+      // 出品中オークション: 商品ページの出品者向け「オークションの編集」で判定。
+      const pageProbe = await probeYahooAuctionOwnership(tabId);
+      isOwner = !!pageProbe.isOwner;
+      if (!isOwner) {
+        // 終了済みオークション: 再出品ページが操作できれば自分のもの。
+        await chrome.tabs.update(tabId, {
+          url:
+            "https://auctions.yahoo.co.jp/sell/jp/show/resubmit?aID=" +
+            encodeURIComponent(listingId),
+        });
+        await waitForTabComplete(tabId, 45000);
+        await remoteSleep(1800);
+        const rp = await probeYahooResubmit(tabId, listingId);
+        isOwner = !!(rp && rp.operable);
+      }
+      if (!isOwner) {
+        // 最後の保険: 自分の出品中一覧に載っているか走査する。
+        try {
+          isOwner = await scanSellingListForItem(tabId, listingId);
+        } catch (e) {
+          /* 走査失敗時は未所有として扱う */
+        }
+      }
     } else {
       const m = String(task.itemUrl || "").match(/\/item\/(m[A-Za-z0-9]+)/);
       listingId = m && m[1];
