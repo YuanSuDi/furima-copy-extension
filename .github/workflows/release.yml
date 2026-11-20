@@ -1,0 +1,43 @@
+name: Package extension release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Zip extension
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          manifest_version=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
+          if [ "$manifest_version" != "$version" ]; then
+            echo "manifest.json version ($manifest_version) does not match tag ($GITHUB_REF_NAME)"
+            exit 1
+          fi
+          mkdir -p dist/pkg
+          rsync -a --exclude='.git' --exclude='.github' --exclude='dist' --exclude='HANDOVER.md' ./ dist/pkg/
+          cd dist/pkg
+          zip -r "../furima-copy-extension-${version}.zip" .
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          asset="dist/furima-copy-extension-${version}.zip"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "Furima Copy extension $tag. Unzip and load as an unpacked extension in Chrome, or upload this zip to the Chrome Web Store." --verify-tag --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release upload "$tag" "$asset" --clobber --repo "$GITHUB_REPOSITORY"
+          uploaded=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          echo "$uploaded" | grep -qx "furima-copy-extension-${version}.zip" || { echo "Release asset missing"; exit 1; }
