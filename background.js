@@ -722,7 +722,7 @@ async function probeYahooAuctionOwnership(tabId) {
             .map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim())
             .filter(Boolean);
           const sellerSignals = texts.filter((t) =>
-            /オークションの編集|出品の編集|この出品を編集/.test(t)
+            /オークションの編集|出品の編集|この出品を編集|取引ナビ/.test(t)
           );
           return {
             isOwner: sellerSignals.length > 0,
