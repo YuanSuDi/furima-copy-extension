@@ -5,7 +5,11 @@
 
   function itemIdFromUrl(url) {
     const m = String(url || "").match(/\/item\/(m[A-Za-z0-9]+)/);
-    return m ? m[1] : null;
+    if (m) return m[1];
+    // やることリストのカードは取引ページ /transaction/<商品ID> へリンクしており、
+    // その ID がそのまま商品 ID なので、詳細ページを開かずに取得できる。
+    const t = String(url || "").match(/\/transactions?\/(m[A-Za-z0-9]+)/);
+    return t ? t[1] : null;
   }
 
   function scanTodoCards() {

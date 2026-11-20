@@ -71,6 +71,15 @@
     },
     {
       "js": [
+        "readers/yahoo-sold.js"
+      ],
+      "matches": [
+        "https://auctions.yahoo.co.jp/my/closed*"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "js": [
         "lib/store.js",
         "lib/fill.js",
         "fillers/sell-mercari.js"
@@ -141,5 +150,5 @@
     "alarms",
     "scripting"
   ],
-  "version": "0.10.9"
+  "version": "0.11.0"
 }
