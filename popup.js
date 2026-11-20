@@ -136,6 +136,10 @@
     todoScanEnabled: document.getElementById("todoScanEnabled"),
     todoScanInterval: document.getElementById("todoScanInterval"),
     todoScanUnit: document.getElementById("todoScanUnit"),
+    yahooScanEnabled: document.getElementById("yahooScanEnabled"),
+    yahooScanInterval: document.getElementById("yahooScanInterval"),
+    yahooScanUnit: document.getElementById("yahooScanUnit"),
+    yahooStatus: document.getElementById("yahooScanStatus"),
   };
 
   async function renderManager() {
@@ -156,6 +160,27 @@
       mgrEls.todoScanUnit.value = cfg.todoScanUnit || "minutes";
     }
     mgrEls.todoScanInterval.max = mgrEls.todoScanUnit.value === "hours" ? 24 : 1440;
+    mgrEls.yahooScanEnabled.checked = !!cfg.yahooScanEnabled;
+    if (document.activeElement !== mgrEls.yahooScanInterval) {
+      mgrEls.yahooScanInterval.value = cfg.yahooScanInterval || 5;
+    }
+    if (document.activeElement !== mgrEls.yahooScanUnit) {
+      mgrEls.yahooScanUnit.value = cfg.yahooScanUnit || "minutes";
+    }
+    mgrEls.yahooScanInterval.max = mgrEls.yahooScanUnit.value === "hours" ? 24 : 1440;
+    const yahooLines = [];
+    yahooLines.push(
+      "雅虎定时扫描: " +
+        (cfg.yahooScanEnabled
+          ? "已开启（每 " + (cfg.yahooScanInterval || 5) +
+            (cfg.yahooScanUnit === "hours" ? " 小时）" : " 分钟）")
+          : "已关闭")
+    );
+    yahooLines.push("雅虎卖出监测: " + (cfg.lastYahooScanStatus || "未扫描"));
+    if (cfg.lastYahooScanAt) {
+      yahooLines.push("雅虎监测时间: " + new Date(cfg.lastYahooScanAt).toLocaleString("zh-CN"));
+    }
+    mgrEls.yahooStatus.textContent = yahooLines.join("\n");
     const lines = [];
     lines.push("状態: " + (cfg.lastStatus || "未設定"));
     lines.push(
@@ -184,6 +209,14 @@
         "保存失败：扫描间隔必须是 1 到 " + max + (unit === "hours" ? " 小时" : " 分钟");
       return;
     }
+    const yahooInterval = Number(mgrEls.yahooScanInterval.value);
+    const yahooUnit = mgrEls.yahooScanUnit.value;
+    const yahooMax = yahooUnit === "hours" ? 24 : 1440;
+    if (!Number.isInteger(yahooInterval) || yahooInterval < 1 || yahooInterval > yahooMax) {
+      mgrEls.status.textContent =
+        "保存失败：Yahoo 扫描间隔必须是 1 到 " + yahooMax + (yahooUnit === "hours" ? " 小时" : " 分钟");
+      return;
+    }
     mgrEls.status.textContent = "正在保存设置…";
     try {
       const result = await chrome.runtime.sendMessage({
@@ -194,6 +227,9 @@
         todoScanEnabled: mgrEls.todoScanEnabled.checked,
         todoScanInterval: interval,
         todoScanUnit: unit,
+        yahooScanEnabled: mgrEls.yahooScanEnabled.checked,
+        yahooScanInterval: yahooInterval,
+        yahooScanUnit: yahooUnit,
       });
       if (!result || !result.ok) {
         mgrEls.status.textContent =
@@ -208,8 +244,12 @@
   };
   document.getElementById("mgrSave").addEventListener("click", saveManagerConfig);
   document.getElementById("todoScanSave").addEventListener("click", saveManagerConfig);
+  document.getElementById("yahooScanSave").addEventListener("click", saveManagerConfig);
   mgrEls.todoScanUnit.addEventListener("change", () => {
     mgrEls.todoScanInterval.max = mgrEls.todoScanUnit.value === "hours" ? 24 : 1440;
+  });
+  mgrEls.yahooScanUnit.addEventListener("change", () => {
+    mgrEls.yahooScanInterval.max = mgrEls.yahooScanUnit.value === "hours" ? 24 : 1440;
   });
 
   document.getElementById("mgrPollNow").addEventListener("click", () => {
@@ -229,6 +269,20 @@
       }
     } catch (error) {
       mgrEls.status.textContent =
+        "立即扫描失败：" + String((error && error.message) || error);
+    }
+  });
+
+  document.getElementById("yahooScanNow").addEventListener("click", async () => {
+    mgrEls.yahooStatus.textContent = "Yahoo 扫描中…";
+    try {
+      const result = await chrome.runtime.sendMessage({ type: "FurimaYahooScanNow" });
+      await renderManager();
+      if (result && !result.ok && !result.skipped) {
+        mgrEls.yahooStatus.textContent += "\n立即扫描失败：" + (result.error || "未知错误");
+      }
+    } catch (error) {
+      mgrEls.yahooStatus.textContent =
         "立即扫描失败：" + String((error && error.message) || error);
     }
   });
