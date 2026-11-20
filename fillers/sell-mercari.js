@@ -24,15 +24,27 @@
 
   // 説明の末尾へ「管理No：<code>」を引き継ぐ（管理プログラムの商品番号）。
   // 既に同じ番号が末尾にあればそのまま、別の番号があれば付け替える。
+  // Mercari の説明は 1000 文字まで。足すと超える場合は本文の末尾を削って
+  // 管理No の行を優先する（実測で 1007/1000 になり出品が止まったため）。
+  const DESC_MAX = 1000;
+  let codeLineTrimmed = false;
   function ensureCodeLine(text, code) {
+    codeLineTrimmed = false;
     const base = text == null ? "" : String(text);
     if (!code) return base;
     const tail = base.match(/\n*\s*管理\s*No[:：]?\s*(\S+)\s*$/);
-    if (tail && tail[1] === code) return base;
+    if (tail && tail[1] === code && base.length <= DESC_MAX) return base;
     const cleaned = base
       .replace(/\n*\s*管理\s*No[:：]?\s*\S+\s*$/, "")
       .replace(/\s+$/g, "");
-    return cleaned + "\n\n管理No：" + code;
+    const suffix = "\n\n管理No：" + code;
+    const room = DESC_MAX - suffix.length;
+    let body = cleaned;
+    if (body.length > room) {
+      body = body.slice(0, room).replace(/\s+$/g, "");
+      codeLineTrimmed = true;
+    }
+    return body + suffix;
   }
 
   // 誤クリック防止（v0.7.3）: ファイル入力を含む要素や「画像を選択」系の
@@ -335,7 +347,12 @@
       lines.push({
         label: "管理No",
         status: "ok",
-        note: data.inventoryCode + "（説明の末尾に自動で入ります）",
+        note:
+          data.inventoryCode +
+          "（説明の末尾に自動で入ります）" +
+          (codeLineTrimmed
+            ? " ※1000文字に収めるため本文末尾を少し削りました"
+            : ""),
       });
     }
     lines.push({
@@ -807,19 +824,13 @@
         await reportListingUrl(location.href);
         return;
       }
-      const bodyText = (document.body && document.body.textContent) || "";
-      if (/出品しました|出品が完了/.test(bodyText)) {
-        const listingUrl = await FF.waitFor(findCompletionListingUrl, 10000, 500);
-        if (listingUrl) {
-          await reportListingUrl(listingUrl);
-        } else {
-          await report({
-            ok: false,
-            stage: "verify",
-            message:
-              "出品完了を確認しましたが、「出品した商品を見る」リンクから商品 ID を取得できませんでした。参照 URL は更新されていません。",
-          });
-        }
+      // 完了の証拠は「出品した商品を見る」リンク（/item/<新しい ID>）か
+      // 商品ページへの遷移だけとする。本文の「出品しました」「出品が完了」
+      // といった文字列は未送信のフォーム上にも現れうるため証拠には使わない
+      // （過去にそれで誤判定し、本物のクリック再試行前に終了した）。
+      const listingUrl = findCompletionListingUrl();
+      if (listingUrl) {
+        await reportListingUrl(listingUrl);
         return;
       }
       if (!modalClicked) {
