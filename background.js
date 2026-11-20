@@ -407,11 +407,12 @@ async function recaptureImages(itemUrl) {
 //   4. 結果（成否・出品 URL・手動項目）をプログラムへ返す
 // 自動出品（送信）を行うのは管理プログラムから来たタスクだけ。
 // 通常のコピー＆入力と Gist リモート再出品は従来どおり入力止まり。
-// 対応プラットフォームは v1 では Mercari のみ（他は pending のまま残す）。
+// 対応プラットフォームは Mercari と Yahoo!オークション（他は pending のまま残す）。
 // ============================================================================
 
 const MANAGER_ALARM = "fcManagerPoll";
 const TODO_SCAN_ALARM = "fcMercariTodoScan";
+const YAHOO_SCAN_ALARM = "fcYahooSoldScan";
 const MANAGER_DEFAULTS = {
   enabled: false,
   baseUrl: "http://127.0.0.1:17341",
@@ -423,12 +424,18 @@ const MANAGER_DEFAULTS = {
   lastStatus: "未設定",
   lastSaleScanAt: null,
   lastSaleScanStatus: "未スキャン",
+  yahooScanEnabled: false,
+  yahooScanInterval: 5,
+  yahooScanUnit: "minutes",
+  lastYahooScanAt: null,
+  lastYahooScanStatus: "未スキャン",
 };
 const MANAGER_SELL_URLS = {
   mercari: "https://jp.mercari.com/sell/create",
 };
 let managerRunning = false;
 let soldScanRunning = false;
+let yahooScanRunning = false;
 
 async function getManagerConfig() {
   const res = await chrome.storage.local.get("managerConfig");
@@ -545,6 +552,137 @@ async function scanMercariSoldTodos(cfg, force) {
   }
 }
 
+// Yahoo!オークション「出品終了分（落札者あり）」をスキャンし、
+// 「発送をしてください」（支払い済み・発送待ち）の商品を管理プログラムへ
+// platform=yahoo で報告する。Mercari の Todo スキャンと同じ形。
+async function scanYahooSold(cfg, force) {
+  if (!cfg.yahooScanEnabled && !force) return { ok: true, skipped: true };
+  if (yahooScanRunning) return { ok: false, error: "Yahoo 扫描正在进行中" };
+  yahooScanRunning = true;
+  const stopKeepAlive = startKeepAlive();
+  let scanTab = null;
+  let found = 0;
+  let matched = 0;
+  let unmatched = 0;
+  try {
+    scanTab = await chrome.tabs.create({
+      url: "https://auctions.yahoo.co.jp/my/closed?hasWinner=1",
+      active: false,
+    });
+    await waitForTabComplete(scanTab.id, 45000);
+    await remoteSleep(2500);
+    const scan = await sendToTabWithRetry(
+      scanTab.id,
+      { type: "FurimaScanYahooSold" },
+      10,
+      2000
+    );
+    const entries = scan && scan.entries ? scan.entries : [];
+    found = entries.length;
+    for (const entry of entries) {
+      const report = await managerFetch(cfg, "/api/sales/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          platform: "yahoo",
+          itemId: entry.itemId,
+          listingUrl: entry.listingUrl,
+          statusText: entry.statusText,
+          at: new Date().toISOString(),
+        }),
+      });
+      if (report && report.matched) matched += 1;
+      else unmatched += 1;
+    }
+    await setManagerConfig({
+      lastYahooScanAt: new Date().toISOString(),
+      lastYahooScanStatus:
+        "発送待ち " + found + "件 / 在庫連携 " + matched +
+        "件 / 商品未一致 " + unmatched + "件",
+    });
+    return { ok: true };
+  } catch (e) {
+    console.warn("[FurimaCopy] yahoo sold scan failed", e);
+    await setManagerConfig({
+      lastYahooScanAt: new Date().toISOString(),
+      lastYahooScanStatus: "スキャン失敗: " + String((e && e.message) || e),
+    });
+    return { ok: false, error: String((e && e.message) || e) };
+  } finally {
+    if (scanTab) {
+      try {
+        await chrome.tabs.remove(scanTab.id);
+      } catch (e) {}
+    }
+    yahooScanRunning = false;
+    stopKeepAlive();
+  }
+}
+
+// Yahoo!オークションの管理タスクを実行する。再出品はプラットフォーム
+// 自体の再出品ページを使う（コピーはしない）: 対象の再出品ページを開き、
+// バッチ再出品と同じ処理で送信まで進め、出品中一覧で確認してから
+// 管理プログラムへ結果を返す。再出品は同じオークション ID のまま。
+async function executeYahooManagerTask(cfg, task) {
+  const stopKeepAlive = startKeepAlive();
+  const postResult = async (ok, listingUrl, message) => {
+    try {
+      await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ok: !!ok,
+          listingUrl: listingUrl || null,
+          message: message || null,
+        }),
+      });
+    } catch (e) {
+      console.warn("[FurimaCopy] manager result post failed", e);
+    }
+    await setManagerConfig({
+      lastStatus: (ok ? "完了: " : "失敗: ") + (message || task.title || task.id),
+    });
+  };
+  let workTabId = null;
+  let keepWorkTab = false;
+  try {
+    await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/claim", {
+      method: "POST",
+    });
+    await setManagerConfig({ lastStatus: "実行中: " + (task.title || task.id) });
+    if (!task.autoSubmit) {
+      throw new Error("自動出品が無効なタスクのため実行しませんでした");
+    }
+    const m =
+      String(task.itemUrl || "").match(/\/jp\/auction\/([a-zA-Z]?\d+)/) ||
+      String(task.itemUrl || "").match(/^([a-zA-Z]?\d+)$/);
+    const itemId = m && m[1];
+    if (!itemId) {
+      throw new Error("タスクのオークション ID を特定できませんでした: " + (task.itemUrl || ""));
+    }
+    const workTab = await chrome.tabs.create({ active: true });
+    workTabId = workTab.id;
+    await processYahooRelistItem(workTabId, { id: itemId, title: task.title || "" });
+    await postResult(
+      true,
+      "https://auctions.yahoo.co.jp/jp/auction/" + itemId,
+      "ヤフオク再出品が完了しました"
+    );
+  } catch (e) {
+    keepWorkTab = !!workTabId;
+    await postResult(false, null, String((e && e.message) || e));
+  } finally {
+    if (workTabId && !keepWorkTab) {
+      try {
+        await chrome.tabs.remove(workTabId);
+      } catch (e) {
+        /* Tab may already be closed. */
+      }
+    }
+    stopKeepAlive();
+  }
+}
+
 async function pollManagerTasks(why) {
   const cfg = await getManagerConfig();
   if (!cfg.enabled || managerRunning) return;
@@ -558,14 +696,17 @@ async function pollManagerTasks(why) {
     });
     return;
   }
-  const task = (data.tasks || []).find((t) => t.platform === "mercari");
+  const task = (data.tasks || []).find(
+    (t) => t.platform === "mercari" || t.platform === "yahoo"
+  );
   if (!task) {
     await setManagerConfig({ lastStatus: "待機中（タスクなし） " + (why || "") });
     return;
   }
   managerRunning = true;
   try {
-    await executeManagerTask(cfg, task);
+    if (task.platform === "yahoo") await executeYahooManagerTask(cfg, task);
+    else await executeManagerTask(cfg, task);
   } catch (e) {
     console.warn("[FurimaCopy] manager task failed", e);
   } finally {
@@ -862,13 +1003,42 @@ function restoreTodoScanAlarm() {
     .catch((error) => console.error("[FurimaCopy] failed to restore Todo scan schedule", error));
 }
 
+function yahooScanPeriodInMinutes(config) {
+  const interval = Number(config.yahooScanInterval);
+  const unit = config.yahooScanUnit;
+  if (!Number.isInteger(interval) || interval < 1) {
+    throw new Error("Yahoo 扫描间隔必须是正整数");
+  }
+  if (unit === "minutes" && interval <= 1440) return interval;
+  if (unit === "hours" && interval <= 24) return interval * 60;
+  throw new Error("Yahoo 扫描间隔无效：分钟最多 1440，小时最多 24");
+}
+
+async function updateYahooScanAlarm(config) {
+  if (!config.yahooScanEnabled) {
+    await chrome.alarms.clear(YAHOO_SCAN_ALARM);
+    return;
+  }
+  chrome.alarms.create(YAHOO_SCAN_ALARM, {
+    periodInMinutes: yahooScanPeriodInMinutes(config),
+  });
+}
+
+function restoreYahooScanAlarm() {
+  getManagerConfig()
+    .then(updateYahooScanAlarm)
+    .catch((error) => console.error("[FurimaCopy] failed to restore Yahoo scan schedule", error));
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(MANAGER_ALARM, { periodInMinutes: 1 });
   restoreTodoScanAlarm();
+  restoreYahooScanAlarm();
 });
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(MANAGER_ALARM, { periodInMinutes: 1 });
   restoreTodoScanAlarm();
+  restoreYahooScanAlarm();
   pollManagerTasks("startup");
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -877,6 +1047,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     getManagerConfig()
       .then((config) => scanMercariSoldTodos(config))
       .catch((error) => console.error("[FurimaCopy] scheduled Todo scan failed", error));
+  }
+  if (alarm.name === YAHOO_SCAN_ALARM) {
+    getManagerConfig()
+      .then((config) => scanYahooSold(config))
+      .catch((error) => console.error("[FurimaCopy] scheduled Yahoo scan failed", error));
   }
 });
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -889,6 +1064,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         todoScanInterval: interval,
         todoScanUnit: unit,
       });
+      const yahooInterval = Number(msg.yahooScanInterval);
+      const yahooUnit = msg.yahooScanUnit;
+      const yahooScanEnabled = !!msg.yahooScanEnabled;
+      yahooScanPeriodInMinutes({
+        yahooScanInterval: yahooInterval,
+        yahooScanUnit: yahooUnit,
+      });
       const config = await setManagerConfig({
         enabled: !!msg.enabled,
         baseUrl: String(msg.baseUrl || "").trim() || "http://127.0.0.1:17341",
@@ -896,12 +1078,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         todoScanEnabled,
         todoScanInterval: interval,
         todoScanUnit: unit,
+        yahooScanEnabled,
+        yahooScanInterval: yahooInterval,
+        yahooScanUnit: yahooUnit,
       });
       await updateTodoScanAlarm(config);
+      await updateYahooScanAlarm(config);
       sendResponse({ ok: true });
     })().catch((error) => {
       sendResponse({ ok: false, error: String((error && error.message) || error) });
     });
+    return true;
+  }
+  if (msg && msg.type === "FurimaYahooScanNow") {
+    getManagerConfig()
+      .then((config) => scanYahooSold(config, true))
+      .then(sendResponse)
+      .catch((error) => sendResponse({
+        ok: false,
+        error: String((error && error.message) || error),
+      }));
     return true;
   }
   if (msg && msg.type === "FurimaTodoScanNow") {
@@ -1179,6 +1375,9 @@ async function inspectAndAdvanceYahooRelist(
         return { status: "success" };
       }
       if (!url.pathname.startsWith("/sell/jp/show/")) {
+        // 送信クリック後は /sell/jp/config/submit のような完了側のページへ
+        // 遷移して終わることがある。成否は出品中一覧で確かめる。
+        if (didFinalSubmit) return { status: "verify" };
         return {
           status: "error",
           error: "再出品後の完了を確認できないページへ移動しました: " + url.pathname,
@@ -1259,11 +1458,104 @@ async function inspectAndAdvanceYahooRelist(
   return results[0] && results[0].result;
 }
 
+// 出品中一覧を全ページ走査し、対象の商品 ID が載っているか返す。
+// Yahoo! の再出品は同じ商品 ID のまま再開されるため、ID で直接確認できる。
+async function scanSellingListForItem(tabId, itemId) {
+  await chrome.tabs.update(tabId, {
+    url: "https://auctions.yahoo.co.jp/my/selling",
+    active: true,
+  });
+  if (!(await waitForTabComplete(tabId, 45000))) return false;
+  await remoteSleep(1200);
+  for (let page = 0; page < 10; page++) {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [itemId],
+      func: (targetId) => {
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        const found = links.some((a) => {
+          try {
+            return new URL(a.href, location.href).pathname === "/jp/auction/" + targetId;
+          } catch (e) {
+            return false;
+          }
+        });
+        let nextUrl = null;
+        if (!found) {
+          for (const a of links) {
+            const label = (a.innerText || a.getAttribute("aria-label") || "")
+              .replace(/\s+/g, " ")
+              .trim();
+            try {
+              const u = new URL(a.href, location.href);
+              if (
+                u.pathname === "/my/selling" &&
+                u.href !== location.href &&
+                /^(次へ|次のページ|›|»)/.test(label)
+              ) {
+                nextUrl = u.href;
+                break;
+              }
+            } catch (e) {
+              /* 解析できないリンクは無視する */
+            }
+          }
+        }
+        return { found, nextUrl };
+      },
+    });
+    const r = results[0] && results[0].result;
+    if (!r) return false;
+    if (r.found) return true;
+    if (!r.nextUrl) return false;
+    await chrome.tabs.update(tabId, { url: r.nextUrl, active: true });
+    if (!(await waitForTabComplete(tabId, 45000))) return false;
+    await remoteSleep(800);
+  }
+  return false;
+}
+
+// 再出品の送信後、その商品が出品中一覧に載っているかで成否を確かめる。
+// 一覧への反映には数分遅れることがあるため、再読み込みしながら待つ。
+async function verifyYahooRelistLive(tabId, itemId) {
+  for (let round = 0; round < 10; round++) {
+    if (await scanSellingListForItem(tabId, itemId)) return true;
+    await remoteSleep(10000);
+  }
+  return false;
+}
+
 async function processYahooRelistItem(tabId, item) {
   const url =
     "https://auctions.yahoo.co.jp/sell/jp/show/resubmit?aID=" +
     encodeURIComponent(item.id);
   await chrome.tabs.update(tabId, { url, active: true });
+  // 前の商品の完了ページが残ったまま判定すると、未処理の商品を成功と
+  // 誤判定したり商品 ID 不一致で止まったりするため、この商品の
+  // 再出品 URL に実際に遷移したことを確認してから進む。
+  let onTargetPage = false;
+  for (let i = 0; i < 40; i++) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      const u = new URL(t.url || "");
+      if (
+        u.origin === "https://auctions.yahoo.co.jp" &&
+        u.pathname === "/sell/jp/show/resubmit" &&
+        u.searchParams.get("aID") === item.id
+      ) {
+        onTargetPage = true;
+        break;
+      }
+    } catch (e) {
+      /* タブ取得に失敗したら次のポーリングで再確認する */
+    }
+    await remoteSleep(500);
+  }
+  if (!onTargetPage) {
+    throw new Error(
+      "再出品ページへの移動を確認できませんでした（商品 ID: " + item.id + "）"
+    );
+  }
   if (!(await waitForTabComplete(tabId, 45000))) {
     throw new Error("再出品フォームの読み込みがタイムアウトしました");
   }
@@ -1280,6 +1572,12 @@ async function processYahooRelistItem(tabId, item) {
     );
     if (!page) throw new Error("再出品ページから応答がありませんでした");
     if (page.status === "success") return { success: true };
+    if (page.status === "verify") {
+      if (await verifyYahooRelistLive(tabId, item.id)) return { success: true };
+      throw new Error(
+        "送信後に出品中一覧で再出品を確認できませんでした。重複送信を避けるため処理を停止しました"
+      );
+    }
     if (page.status === "error") throw new Error(page.error || "再出品ページを確認できませんでした");
     if (page.status === "clicked") {
       if (page.kind === "submit") finalSubmitClicked = true;
