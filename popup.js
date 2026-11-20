@@ -182,6 +182,15 @@
     }
     mgrEls.yahooStatus.textContent = yahooLines.join("\n");
     const lines = [];
+    const nodeRes = await chrome.storage.local.get("fcNodeId");
+    const nodeShort = nodeRes.fcNodeId ? String(nodeRes.fcNodeId).slice(0, 8) : "—";
+    lines.push(
+      "ノード: " +
+        (cfg.nodeName
+          ? cfg.nodeName
+          : "未登録（管理プログラムの「連携情報」で名前を付けられます）") +
+        "（ID " + nodeShort + "…）"
+    );
     lines.push("状態: " + (cfg.lastStatus || "未設定"));
     lines.push(
       "Todo 定时扫描: " +

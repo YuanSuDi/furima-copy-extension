@@ -448,13 +448,33 @@ async function setManagerConfig(patch) {
   return cfg;
 }
 
+// v0.12.0: ノード ID（Chrome プロファイル単位の恒久 ID）。
+// 管理プログラムはこの ID でタスクを振り分け、名前はプログラム側でのみ登録する。
+let fcNodeIdCache = null;
+async function getNodeId() {
+  if (fcNodeIdCache) return fcNodeIdCache;
+  const res = await chrome.storage.local.get("fcNodeId");
+  if (res.fcNodeId) {
+    fcNodeIdCache = String(res.fcNodeId);
+    return fcNodeIdCache;
+  }
+  const id =
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : "node-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
+  await chrome.storage.local.set({ fcNodeId: id });
+  fcNodeIdCache = id;
+  return id;
+}
+
 async function managerFetch(cfg, path, init) {
   const base = String(cfg.baseUrl || "").replace(/\/$/, "");
+  const nodeId = await getNodeId();
   const res = await fetch(
     base + path,
     Object.assign({}, init || {}, {
       headers: Object.assign(
-        { "x-fc-token": cfg.token || "" },
+        { "x-fc-token": cfg.token || "", "x-fc-node": nodeId },
         (init && init.headers) || {}
       ),
     })
@@ -619,6 +639,199 @@ async function scanYahooSold(cfg, force) {
   }
 }
 
+// v0.12.0: タスクを「失敗」で燃やさず、キューヘ返却する（所有権ゲート用）。
+async function releaseManagerTask(cfg, task, reason) {
+  try {
+    await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/release", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: reason || "not-owner" }),
+    });
+  } catch (e) {
+    console.warn("[FurimaCopy] task release failed", e);
+  }
+}
+
+// Mercari 商品ページで「自分の商品か」を判定する。
+// 出品者向けコントロール（商品の編集 / 出品を一時停止 等）が見えていること
+// を肯定的な証拠とし、見えなければ他人の商品として扱う（fail-closed）。
+async function probeMercariOwnership(tabId) {
+  let last = { isOwner: false, sellerSignals: [], buyerSignals: [] };
+  for (let i = 0; i < 5; i++) {
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return (
+              s.display !== "none" &&
+              s.visibility !== "hidden" &&
+              el.getClientRects().length > 0
+            );
+          };
+          const texts = Array.from(
+            document.querySelectorAll('a, button, [role="button"]')
+          )
+            .filter(visible)
+            .map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim())
+            .filter(Boolean);
+          const sellerSignals = texts.filter((t) =>
+            /出品を一時停止|一時停止する|商品の編集/.test(t)
+          );
+          const buyerSignals = texts.filter((t) => /購入手続き|購入に進む/.test(t));
+          return {
+            isOwner: sellerSignals.length > 0,
+            sellerSignals: sellerSignals.slice(0, 3),
+            buyerSignals: buyerSignals.slice(0, 3),
+          };
+        },
+      });
+      if (results[0] && results[0].result) last = results[0].result;
+      if (last.isOwner) return last;
+    } catch (e) {
+      /* ページ準備中なら少し待って再試行する */
+    }
+    await remoteSleep(2000);
+  }
+  return last;
+}
+
+// Yahoo 再出品ページが操作可能か（＝自分の商品か）を、クリックせずに判定する。
+async function probeYahooResubmit(tabId, itemId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [itemId],
+      func: (expectedId) => {
+        const url = new URL(location.href);
+        if (url.origin !== "https://auctions.yahoo.co.jp") {
+          return { operable: false, reason: "別ドメインへ遷移しました: " + url.origin };
+        }
+        if (!url.pathname.startsWith("/sell/jp/show/")) {
+          return { operable: false, reason: "再出品ページではありません: " + url.pathname };
+        }
+        const aID = url.searchParams.get("aID");
+        if (aID && aID !== expectedId) {
+          return { operable: false, reason: "商品 ID が一致しません" };
+        }
+        const bodyText = String(document.body ? document.body.innerText || "" : "");
+        if (/再出品できません|出品できません|存在しません|エラーが発生/.test(bodyText)) {
+          return { operable: false, reason: "再出品できない旨の表示があります" };
+        }
+        const visible = (el) => {
+          const s = getComputedStyle(el);
+          return (
+            s.display !== "none" &&
+            s.visibility !== "hidden" &&
+            el.getClientRects().length > 0
+          );
+        };
+        const labels = Array.from(
+          document.querySelectorAll(
+            'button, input[type="submit"], input[type="button"], [role="button"]'
+          )
+        )
+          .filter(visible)
+          .map((el) =>
+            String(el.innerText || el.value || "").replace(/\s+/g, " ").trim()
+          )
+          .filter(Boolean);
+        const hasAction = labels.some((t) => /確認|出品する|再出品する/.test(t));
+        return { operable: hasAction, labels: labels.slice(0, 8) };
+      },
+    });
+    return (
+      (results[0] && results[0].result) || { operable: false, reason: "応答がありません" }
+    );
+  } catch (e) {
+    return { operable: false, reason: String((e && e.message) || e) };
+  }
+}
+
+// v0.12.0: 所有権確認タスク（type=verify）。管理プログラムで手貼りした
+// レコードについて、各ブラウザが「その商品は自分のものか」を実地で確かめ、
+// 本人だけが /api/claims で名乗りを上げる。他人の場合は notOwner で返し、
+// サーバ側で試行済みとしてこのノードには再配信されなくなる。
+async function executeVerifyTask(cfg, task) {
+  const stopKeepAlive = startKeepAlive();
+  let tabId = null;
+  try {
+    await setManagerConfig({
+      lastStatus: "所有権確認中: " + (task.product_no || task.id),
+    });
+    let isOwner = false;
+    let listingId = null;
+    if (task.platform === "yahoo") {
+      const m =
+        String(task.itemUrl || "").match(/\/jp\/auction\/([a-zA-Z]?\d+)/) ||
+        String(task.itemUrl || "").match(/^([a-zA-Z]?\d+)$/);
+      listingId = m && m[1];
+      if (!listingId) throw new Error("オークション ID を特定できませんでした");
+      const tab = await chrome.tabs.create({
+        url:
+          "https://auctions.yahoo.co.jp/sell/jp/show/resubmit?aID=" +
+          encodeURIComponent(listingId),
+        active: false,
+      });
+      tabId = tab.id;
+      await waitForTabComplete(tabId, 45000);
+      await remoteSleep(1800);
+      const probe = await probeYahooResubmit(tabId, listingId);
+      isOwner = !!(probe && probe.operable);
+    } else {
+      const m = String(task.itemUrl || "").match(/\/item\/(m[A-Za-z0-9]+)/);
+      listingId = m && m[1];
+      if (!listingId) throw new Error("商品 ID を特定できませんでした");
+      const tab = await chrome.tabs.create({ url: task.itemUrl, active: false });
+      tabId = tab.id;
+      await waitForTabComplete(tabId, 45000);
+      await remoteSleep(2500);
+      const probe = await probeMercariOwnership(tabId);
+      isOwner = !!probe.isOwner;
+    }
+    if (isOwner) {
+      await managerFetch(cfg, "/api/claims", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          platform: task.platform,
+          listingId,
+          taskId: task.id,
+        }),
+      });
+      await setManagerConfig({
+        lastStatus: "所有権を確認しました: " + (task.product_no || listingId),
+      });
+    } else {
+      await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ok: false,
+          notOwner: true,
+          message: "このブラウザの商品ではありません",
+        }),
+      });
+      await setManagerConfig({
+        lastStatus: "所有権なし（確認タスク）: " + (task.product_no || listingId),
+      });
+    }
+  } catch (e) {
+    console.warn("[FurimaCopy] verify task failed", e);
+    await setManagerConfig({
+      lastStatus: "所有権確認に失敗: " + String((e && e.message) || e),
+    });
+  } finally {
+    if (tabId) {
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch (e) {}
+    }
+    stopKeepAlive();
+  }
+}
+
 // Yahoo!オークションの管理タスクを実行する。再出品はプラットフォーム
 // 自体の再出品ページを使う（コピーはしない）: 対象の再出品ページを開き、
 // バッチ再出品と同じ処理で送信まで進め、出品中一覧で確認してから
@@ -662,6 +875,25 @@ async function executeYahooManagerTask(cfg, task) {
     }
     const workTab = await chrome.tabs.create({ active: true });
     workTabId = workTab.id;
+    // v0.12.0 所有権ゲート: 再出品ページが操作できなければ他アカウントの
+    // 商品とみなし、タスクを失敗にせずキューへ返却する。
+    await chrome.tabs.update(workTabId, {
+      url:
+        "https://auctions.yahoo.co.jp/sell/jp/show/resubmit?aID=" +
+        encodeURIComponent(itemId),
+    });
+    await waitForTabComplete(workTabId, 45000);
+    await remoteSleep(1800);
+    const yahooProbe = await probeYahooResubmit(workTabId, itemId);
+    if (!yahooProbe.operable) {
+      await releaseManagerTask(cfg, task, "not-owner");
+      await setManagerConfig({
+        lastStatus:
+          "所有権なしのためタスクを返却しました（ヤフオク " + itemId + "）: " +
+          (yahooProbe.reason || "再出品ページが操作できません"),
+      });
+      return;
+    }
     await processYahooRelistItem(workTabId, { id: itemId, title: task.title || "" });
     await postResult(
       true,
@@ -689,7 +921,12 @@ async function pollManagerTasks(why) {
   let data;
   try {
     data = await managerFetch(cfg, "/api/tasks?status=pending");
-    await setManagerConfig({ lastPollAt: new Date().toISOString() });
+    const patch = { lastPollAt: new Date().toISOString() };
+    if (data.node) {
+      patch.nodeId = data.node.id || null;
+      patch.nodeName = data.node.name || null;
+    }
+    await setManagerConfig(patch);
   } catch (e) {
     await setManagerConfig({
       lastStatus: "接続できません（プログラム未起動？）",
@@ -705,7 +942,8 @@ async function pollManagerTasks(why) {
   }
   managerRunning = true;
   try {
-    if (task.platform === "yahoo") await executeYahooManagerTask(cfg, task);
+    if (task.type === "verify") await executeVerifyTask(cfg, task);
+    else if (task.platform === "yahoo") await executeYahooManagerTask(cfg, task);
     else await executeManagerTask(cfg, task);
   } catch (e) {
     console.warn("[FurimaCopy] manager task failed", e);
@@ -765,6 +1003,24 @@ async function executeManagerTask(cfg, task) {
       }
       await waitForTabComplete(itemTab.id, 45000);
       await remoteSleep(3000); // SPA の描画待ち
+      // v0.12.0 所有権ゲート: 出品者向けコントロールが見えなければ
+      // 他アカウントの商品とみなし、タスクを失敗にせずキューへ返却する。
+      const ownProbe = await probeMercariOwnership(itemTab.id);
+      if (!ownProbe.isOwner) {
+        try {
+          await chrome.tabs.remove(itemTab.id);
+        } catch (e) {
+          /* noop */
+        }
+        await releaseManagerTask(cfg, task, "not-owner");
+        await setManagerConfig({
+          lastStatus:
+            "所有権なしのためタスクを返却しました（メルカリ " +
+            (task.product_no || task.id) +
+            "）",
+        });
+        return;
+      }
       const copyRes = await sendToTabWithRetry(
         itemTab.id,
         { type: "FurimaRemoteCopy" },
@@ -844,7 +1100,7 @@ async function executeManagerTask(cfg, task) {
     for (const u of imageUrls) {
       try {
         const r = await fetch(u, {
-          headers: { "x-fc-token": cfg.token || "" },
+          headers: { "x-fc-token": cfg.token || "", "x-fc-node": await getNodeId() },
         });
         if (!r.ok) throw new Error("HTTP " + r.status);
         const buf = await r.arrayBuffer();
