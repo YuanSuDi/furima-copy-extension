@@ -741,7 +741,19 @@ async function probeYahooAuctionOwnership(tabId) {
 }
 
 // Yahoo 再出品ページが操作可能か（＝自分の商品か）を、クリックせずに判定する。
+// 決定的な結果（操作可能 / すでに再出品済み / エラー表示 / 別ページ遷移）
+// 以外はページ描画待ちの可能性があるため、数回リトライする。
 async function probeYahooResubmit(tabId, itemId) {
+  let last = { operable: false, reason: "応答がありません" };
+  for (let i = 0; i < 3; i++) {
+    last = await probeYahooResubmitOnce(tabId, itemId);
+    if (last.operable || last.definitive) return last;
+    await remoteSleep(2000);
+  }
+  return last;
+}
+
+async function probeYahooResubmitOnce(tabId, itemId) {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
@@ -749,18 +761,23 @@ async function probeYahooResubmit(tabId, itemId) {
       func: (expectedId) => {
         const url = new URL(location.href);
         if (url.origin !== "https://auctions.yahoo.co.jp") {
-          return { operable: false, reason: "別ドメインへ遷移しました: " + url.origin };
+          return { operable: false, definitive: true, reason: "別ドメインへ遷移しました: " + url.origin };
         }
         if (!url.pathname.startsWith("/sell/jp/show/")) {
-          return { operable: false, reason: "再出品ページではありません: " + url.pathname };
+          return { operable: false, definitive: true, reason: "再出品ページではありません: " + url.pathname };
         }
         const aID = url.searchParams.get("aID");
         if (aID && aID !== expectedId) {
-          return { operable: false, reason: "商品 ID が一致しません" };
+          return { operable: false, definitive: true, reason: "商品 ID が一致しません" };
         }
         const bodyText = String(document.body ? document.body.innerText || "" : "");
+        if (/すでに再出品されています/.test(bodyText)) {
+          // 所有権なしではなく「再出品の目的は達成済み」。呼び出し側で
+          // 完了として扱う（所有権なしで返却するとタスクが回り続ける）。
+          return { operable: false, definitive: true, alreadyRelisted: true, reason: "すでに再出品されています" };
+        }
         if (/再出品できません|出品できません|存在しません|エラーが発生/.test(bodyText)) {
-          return { operable: false, reason: "再出品できない旨の表示があります" };
+          return { operable: false, definitive: true, reason: "再出品できない旨の表示があります" };
         }
         const visible = (el) => {
           const s = getComputedStyle(el);
@@ -944,6 +961,16 @@ async function executeYahooManagerTask(cfg, task) {
     await waitForTabComplete(workTabId, 45000);
     await remoteSleep(1800);
     const yahooProbe = await probeYahooResubmit(workTabId, itemId);
+    if (yahooProbe.alreadyRelisted) {
+      // すでに再出品済み = 再出品の目的は達成されている。所有権なしとして
+      // 返却すると同じタスクが回り続けるため、完了として結果を返す。
+      await postResult(
+        true,
+        "https://auctions.yahoo.co.jp/jp/auction/" + itemId,
+        "すでに再出品済みでした（このオークションは再出品されています）"
+      );
+      return;
+    }
     if (!yahooProbe.operable) {
       await releaseManagerTask(cfg, task, "not-owner");
       await setManagerConfig({
