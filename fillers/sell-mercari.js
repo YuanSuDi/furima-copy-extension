@@ -557,7 +557,7 @@
       if (r.unverified) note += "（画面への反映を確認できず）";
       lines.push({
         label: "画像",
-        status: r.attached && !r.unverified ? "ok" : r.attached ? "manual" : "fail",
+        status: r.attached && !r.unverified ? "ok" : r.attached ? (data.managerTask ? "fail" : "manual") : "fail",
         note,
       });
     } else {
@@ -577,7 +577,7 @@
       }
       lines.push({
         label: "カテゴリ",
-        status: picked ? "ok" : "manual",
+        status: picked ? "ok" : data.managerTask ? "fail" : "manual",
         // 成功時はコピー元の文字列ではなく、フォームに実際に表示されたパスを出す。
         note: picked
           ? picked
@@ -586,7 +586,7 @@
     } else {
       lines.push({
         label: "カテゴリ",
-        status: "manual",
+        status: data.managerTask ? "fail" : "manual",
         note: "手動" + (data.categoryText ? "（候補： " + data.categoryText + "）" : "で選択してください"),
       });
     }
@@ -599,7 +599,7 @@
       }
       lines.push({
         label: "商品の状態",
-        status: ok ? "ok" : "manual",
+        status: ok ? "ok" : data.managerTask ? "fail" : "manual",
         note: ok
           ? data.conditionText
           : "自動選択できませんでした（候補： " + data.conditionText + "）",
@@ -607,7 +607,7 @@
     } else {
       lines.push({
         label: "商品の状態",
-        status: "manual",
+        status: data.managerTask ? "fail" : "manual",
         note: "手動" + (data.conditionText ? "（候補： " + data.conditionText + "）" : "で選択してください"),
       });
     }
@@ -934,10 +934,21 @@
       if (fr && Date.now() - fr.at < 5 * 60 * 1000) {
         const lines = fr.lines || [];
         const fails = lines.filter((l) => l.status === "fail");
-        const catBad = lines.some(
-          (l) => (l.label || "").includes("カテゴリ") && l.status !== "ok"
+        // v0.12.13: 必須項目は fail ではなく manual の場合も送信しない
+        // （商品の状態などがすり抜け、Mercari 側の検証で弾かれる事故があったため）。
+        const REQUIRED = [
+          "タイトル",
+          "商品の説明",
+          "販売価格",
+          "画像",
+          "カテゴリ",
+          "商品の状態",
+          "配送・送料",
+        ];
+        const reqBad = REQUIRED.filter(
+          (r) => !lines.some((l) => (l.label || "").includes(r) && l.status === "ok")
         );
-        if (fails.length || catBad) {
+        if (fails.length || reqBad.length) {
           console.warn(LOG, "blocked by guard");
           await report({
             ok: false,
