@@ -1041,6 +1041,323 @@ async function executeYahooManagerTask(cfg, task) {
   }
 }
 
+// ============================================================
+// 自動下架タスク（v0.12.14）
+// プログラムの「自動下架」スイッチが ON のレコードについて、在庫より
+// 出品が多くなったときに余剰分を落とす。
+//   Mercari: 出品を「削除」する（停止ではない。ユーザーの確定仕様）。
+//   Yahoo:   入札 0 件なら「取り消し」。入札があれば絶対に触らず、
+//            hasBids で返してプログラム側で手動対応に回す。
+// どちらも所有権ゲート必須・操作後の検証必須・fail-closed。
+// ページ側の導線は実機の犠牲テストで詰める前提の防御的実装。
+// ============================================================
+
+function delistPostResultFactory(cfg, task) {
+  return async (ok, message, extra) => {
+    try {
+      await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ok: !!ok,
+          listingUrl: null,
+          message: message || null,
+          hasBids: !!(extra && extra.hasBids),
+        }),
+      });
+    } catch (e) {
+      console.warn("[FurimaCopy] delist result post failed", e);
+    }
+    await setManagerConfig({
+      lastStatus: (ok ? "下架完了: " : "下架失敗: ") + (message || task.id),
+    });
+  };
+}
+
+async function executeMercariDelistTask(cfg, task) {
+  const stopKeepAlive = startKeepAlive();
+  const postResult = delistPostResultFactory(cfg, task);
+  let tabId = null;
+  try {
+    await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/claim", {
+      method: "POST",
+    });
+    await setManagerConfig({ lastStatus: "下架実行中: " + (task.title || task.id) });
+    const itemId = (String(task.itemUrl || "").match(/(m\d+)/) || [])[1];
+    if (!itemId) throw new Error("タスクの商品 ID を特定できませんでした: " + (task.itemUrl || ""));
+    const tab = await chrome.tabs.create({ url: task.itemUrl, active: true });
+    tabId = tab.id;
+    try {
+      await chrome.tabs.update(tabId, { autoDiscardable: false });
+    } catch (e) {
+      /* noop */
+    }
+    await waitForTabComplete(tabId, 45000);
+    await remoteSleep(2500);
+    // 所有権ゲート（出品中ページの出品者コントロールで判定）。
+    const probe = await probeMercariOwnership(tabId);
+    if (!probe.isOwner) {
+      await releaseManagerTask(cfg, task, "not-owner");
+      await setManagerConfig({
+        lastStatus: "下架をキューへ返却（所有権なし）: " + itemId,
+      });
+      return;
+    }
+    // 編集ページへ遷移する。
+    const toEdit = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(visible);
+          const hit = cands.find((el) =>
+            /商品の編集|編集する/.test(String(el.innerText || "").replace(/\s+/g, " ").trim())
+          );
+          if (!hit) return false;
+          hit.click();
+          return true;
+        },
+      })
+      .then((r) => !!(r[0] && r[0].result))
+      .catch(() => false);
+    if (!toEdit) throw new Error("編集ボタンが見つかりませんでした");
+    await waitForTabComplete(tabId, 45000);
+    await remoteSleep(2500);
+    // 編集ページ末尾の「この出品を削除する」を押す（画像削除アイコン等と
+    // 誤認しないよう、文言が完全なものだけを対象にする）。
+    const delClicked = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(visible);
+          const hit = cands.find((el) => {
+            const t = String(el.innerText || "").replace(/\s+/g, " ").trim();
+            return t === "この出品を削除する" || t === "出品を削除する";
+          });
+          if (!hit) return false;
+          hit.scrollIntoView({ block: "center" });
+          hit.click();
+          return true;
+        },
+      })
+      .then((r) => !!(r[0] && r[0].result))
+      .catch(() => false);
+    if (!delClicked) throw new Error("削除ボタン（この出品を削除する）が見つかりませんでした");
+    await remoteSleep(1800);
+    // 確認モーダルの「削除する」を押す（キャンセル側は絶対に押さない）。
+    const confirmed = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+          const hit = cands.find((el) => {
+            const t = String(el.innerText || "").replace(/\s+/g, " ").trim();
+            return t === "削除する" || t === "この出品を削除する";
+          });
+          if (!hit) return false;
+          hit.click();
+          return true;
+        },
+      })
+      .then((r) => !!(r[0] && r[0].result))
+      .catch(() => false);
+    if (!confirmed) throw new Error("削除の確認ボタンが見つかりませんでした");
+    await remoteSleep(3000);
+    // 検証: 商品ページを開き直し、削除済みであることを確かめる。
+    await chrome.tabs.update(tabId, { url: task.itemUrl, active: true });
+    await waitForTabComplete(tabId, 45000);
+    await remoteSleep(2500);
+    const verified = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const text = String(document.body ? document.body.innerText || "" : "");
+          if (/削除されました|削除された商品|出品が削除/.test(text)) return true;
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(visible);
+          const labels = cands.map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim());
+          const hasBuy = labels.some((t) => /購入手続き/.test(t));
+          const hasSeller = labels.some((t) => /商品の編集|出品を一時停止|編集する/.test(t));
+          // 購入も編集もできない = もう生きている出品ではない。
+          return !hasBuy && !hasSeller;
+        },
+      })
+      .then((r) => !!(r[0] && r[0].result))
+      .catch(() => false);
+    if (!verified) throw new Error("削除を確認できませんでした（商品ページがまだ有効です）");
+    await postResult(true, "出品を削除しました: " + itemId);
+  } catch (e) {
+    await postResult(false, String((e && e.message) || e));
+  } finally {
+    if (tabId != null) {
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch (e) {}
+    }
+    stopKeepAlive();
+  }
+}
+
+// Yahoo 商品ページから入札件数を読み取る。読めなければ null（=中止）。
+async function readYahooBidCount(tabId) {
+  const results = await chrome.scripting
+    .executeScript({
+      target: { tabId },
+      func: () => {
+        const scripts = Array.from(document.querySelectorAll("script"))
+          .map((s) => s.textContent || "")
+          .join("\n");
+        let m = scripts.match(/"(?:bidCount|bids|bid_count)"\s*:\s*(\d+)/);
+        if (m) return parseInt(m[1], 10);
+        const text = String(document.body ? document.body.innerText || "" : "");
+        m = text.match(/入札件数\s*[:：]?\s*(\d+)\s*件/);
+        if (m) return parseInt(m[1], 10);
+        m = text.match(/入札\s*[:：]\s*(\d+)\s*件/);
+        if (m) return parseInt(m[1], 10);
+        if (/入札はありません|入札履歴はありません/.test(text)) return 0;
+        return null;
+      },
+    })
+    .catch(() => null);
+  const v = results && results[0] ? results[0].result : null;
+  return typeof v === "number" && isFinite(v) ? v : null;
+}
+
+async function executeYahooDelistTask(cfg, task) {
+  const stopKeepAlive = startKeepAlive();
+  const postResult = delistPostResultFactory(cfg, task);
+  let tabId = null;
+  try {
+    await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/claim", {
+      method: "POST",
+    });
+    await setManagerConfig({ lastStatus: "下架実行中: " + (task.title || task.id) });
+    const m =
+      String(task.itemUrl || "").match(/\/jp\/auction\/([a-zA-Z]?\d+)/) ||
+      String(task.itemUrl || "").match(/^([a-zA-Z]?\d+)$/);
+    const itemId = m && m[1];
+    if (!itemId) throw new Error("タスクのオークション ID を特定できませんでした: " + (task.itemUrl || ""));
+    const tab = await chrome.tabs.create({ url: task.itemUrl, active: true });
+    tabId = tab.id;
+    try {
+      await chrome.tabs.update(tabId, { autoDiscardable: false });
+    } catch (e) {
+      /* noop */
+    }
+    await waitForTabComplete(tabId, 45000);
+    await remoteSleep(2000);
+    // 所有権ゲート: 商品ページの出品者信号 → 出品中一覧の在席確認。
+    const probe = await probeYahooAuctionOwnership(tabId);
+    if (!probe.isOwner) {
+      const inList = await scanSellingListForItem(tabId, itemId);
+      if (!inList) {
+        await releaseManagerTask(cfg, task, "not-owner");
+        await setManagerConfig({
+          lastStatus: "下架をキューへ返却（所有権なし）: " + itemId,
+        });
+        return;
+      }
+      await chrome.tabs.update(tabId, { url: task.itemUrl, active: true });
+      await waitForTabComplete(tabId, 45000);
+      await remoteSleep(1500);
+    }
+    // 入札チェック: 1件でもあれば絶対に触らない。読めなくても触らない。
+    const bids = await readYahooBidCount(tabId);
+    if (bids === null) {
+      throw new Error("入札件数を確認できなかったため、取消しを中止しました");
+    }
+    if (bids > 0) {
+      await postResult(
+        false,
+        "入札が " + bids + " 件あるため自動取消しを中止しました（手動対応に回します）",
+        { hasBids: true }
+      );
+      return;
+    }
+    // 取消し導線: 商品ページ上の「取り消し」系コントロールを探す。
+    const cancelClicked = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(visible);
+          const hit = cands.find((el) => {
+            const t = String(el.innerText || "").replace(/\s+/g, " ").trim();
+            return /出品の取り消し|出品を取り消す|この出品を取り消す|オークションの取り消し/.test(t);
+          });
+          if (!hit) return false;
+          hit.click();
+          return true;
+        },
+      })
+      .then((r) => !!(r[0] && r[0].result))
+      .catch(() => false);
+    if (!cancelClicked) {
+      throw new Error("取り消しボタンが見つかりませんでした（導線は実機確認で詰めます）");
+    }
+    await waitForTabComplete(tabId, 45000);
+    await remoteSleep(1800);
+    // 確認画面/モーダルで取り消しを確定する（キャンセル・戻るは押さない）。
+    const confirmed = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(
+            document.querySelectorAll('button, a, [role="button"], input[type="submit"]')
+          ).filter(visible);
+          const hit = cands.find((el) => {
+            const t = String(el.innerText || el.value || "").replace(/\s+/g, " ").trim();
+            if (/キャンセル|やめる|戻る|取り消さない/.test(t)) return false;
+            return /^(取り消しする|出品を取り消す|取り消す|この出品を取り消す)$/.test(t);
+          });
+          if (!hit) return false;
+          hit.click();
+          return true;
+        },
+      })
+      .then((r) => !!(r[0] && r[0].result))
+      .catch(() => false);
+    if (!confirmed) throw new Error("取り消しの確認ボタンが見つかりませんでした");
+    await remoteSleep(2500);
+    // 検証: 出品中一覧から消えていること。
+    const stillListed = await scanSellingListForItem(tabId, itemId);
+    if (stillListed) {
+      throw new Error("取消しを確認できませんでした（出品中一覧に残っています）");
+    }
+    await postResult(true, "出品を取り消しました: " + itemId);
+  } catch (e) {
+    await postResult(false, String((e && e.message) || e));
+  } finally {
+    if (tabId != null) {
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch (e) {}
+    }
+    stopKeepAlive();
+  }
+}
+
 async function pollManagerTasks(why) {
   const cfg = await getManagerConfig();
   if (!cfg.enabled || managerRunning) return;
@@ -1069,6 +1386,9 @@ async function pollManagerTasks(why) {
   managerRunning = true;
   try {
     if (task.type === "verify") await executeVerifyTask(cfg, task);
+    else if (task.type === "delist" && task.platform === "yahoo")
+      await executeYahooDelistTask(cfg, task);
+    else if (task.type === "delist") await executeMercariDelistTask(cfg, task);
     else if (task.platform === "yahoo") await executeYahooManagerTask(cfg, task);
     else await executeManagerTask(cfg, task);
   } catch (e) {
