@@ -412,33 +412,39 @@
   // 成功判定は実際の選択状態（radio の checked / select の選択中 option）で行う。
   const tildeNorm = (s) => norm(s).replace(/[〜～]/g, "~");
 
-  // 配送方法の選択肢: radio をちょうど1つ含み、テキストが方法名で始まる要素。
-  // 名前ごとに最小の要素（他の候補を内包しないもの）を残す。
-  function shippingMethodOptions() {
-    const byName = new Map();
-    for (const el of document.querySelectorAll("label, div, li, section")) {
-      if (!FF.isVisible(el) || !onScreen(el)) continue;
-      const radios = el.querySelectorAll('input[type="radio"]');
-      if (radios.length !== 1) continue;
-      const m = norm(el.textContent).match(/^(おてがる配送（[^）]+）)/);
-      if (!m) continue;
-      const name = m[1];
-      const prev = byName.get(name);
-      if (!prev || (prev.container !== el && prev.container.contains(el))) {
-        byName.set(name, { name, container: el, radio: radios[0] });
-      }
+  // 配送方法の選択肢は <li><label>…<input type="radio" name="YAMATO">…<h3>方法名</h3>
+  // という構造（実ページのスナップショットで確認）。radio の name がそのまま
+  // コピー元の deliveryMethod.id なので、第一候補は name で直接引く。
+  // v0.12.8 の実装は候補要素に「画面内にあること」を要求したため、展開しても
+  // 折り目より下にある選択肢を拾えず失敗した。ここでは可視性（display/rect）の
+  // みで判定し、画面外は clickLikeUser の scrollIntoView に任せる。
+  function paypayShippingRadio(data) {
+    const id = data && data.shippingMethodId;
+    if (id) {
+      const byId = document.querySelector(
+        'input[type="radio"][name="' + id + '"]'
+      );
+      if (byId) return byId;
     }
-    return Array.from(byName.values());
+    const target = norm((data && (data.shippingMethod || data.shippingText)) || "");
+    if (!target) return null;
+    for (const h of document.querySelectorAll("h3, h2")) {
+      if (norm(h.textContent) !== target) continue;
+      const box = h.closest("label, li") || h.parentElement;
+      const r = box && box.querySelector('input[type="radio"]');
+      if (r) return r;
+    }
+    return null;
   }
 
-  async function pickPaypayShippingMethod(methodText) {
-    const target = norm(methodText);
-    if (!target) return false;
-    const findTarget = () =>
-      shippingMethodOptions().find((o) => norm(o.name) === target) || null;
-    let opt = findTarget();
-    if (opt && opt.radio.checked) return true;
-    if (!opt) {
+  async function pickPaypayShippingMethod(data) {
+    const radio0 = paypayShippingRadio(data);
+    if (!radio0) return false;
+    if (radio0.checked) return true;
+    const boxOf = (r) => r && (r.closest("label") || r.closest("li") || r.parentElement);
+    const isShown = (r) => !!(r && FF.isVisible(boxOf(r) || r));
+    let radio = radio0;
+    if (!isShown(radio)) {
       // 選択肢が閉じている場合は配送方法の行を押して展開する。
       const sec = fieldSection("配送方法");
       if (sec) {
@@ -450,32 +456,38 @@
           .sort((a, b) => a.textContent.length - b.textContent.length)[0];
         FF.clickLikeUser(inner || sec.section);
       }
-      opt = await FF.waitFor(findTarget, 3000, 250);
-      if (!opt) return false;
-      if (opt.radio.checked) return true;
-    }
-    FF.clickLikeUser(opt.radio);
-    let ok = await FF.waitFor(
-      () => {
-        const o = findTarget();
-        return !!(o && o.radio.checked);
-      },
-      3000,
-      200
-    );
-    if (!ok) {
-      // radio 自体で受けない場合は選択肢の要素ごと押す。
-      FF.clickLikeUser(opt.container);
-      ok = await FF.waitFor(
+      radio = await FF.waitFor(
         () => {
-          const o = findTarget();
-          return !!(o && o.radio.checked);
+          const r = paypayShippingRadio(data);
+          return r && isShown(r) ? r : null;
         },
         3000,
+        250
+      );
+      if (!radio) return false;
+      if (radio.checked) return true;
+    }
+    const verified = () =>
+      FF.waitFor(
+        () => {
+          const r = paypayShippingRadio(data);
+          return !!(r && r.checked);
+        },
+        2500,
         200
       );
+    // 本命は選択肢全体を包む <label> を押すこと（radio へのネイティブ連動＋
+    // React の変更検知の両方に届く）。駄目なら見出し、最後に radio 自体。
+    FF.clickLikeUser(boxOf(radio) || radio);
+    if (await verified()) return true;
+    const box = boxOf(radio);
+    const heading = box && box.querySelector("h3, h2");
+    if (heading) {
+      FF.clickLikeUser(heading);
+      if (await verified()) return true;
     }
-    return !!ok;
+    FF.clickLikeUser(radio);
+    return !!(await verified());
   }
 
   // 発送までの日数 / 発送元の地域（ネイティブ select）。選択後の option で検証する。
@@ -614,7 +626,7 @@
       if (method) {
         let ok = false;
         try {
-          ok = await pickPaypayShippingMethod(method);
+          ok = await pickPaypayShippingMethod(data);
         } catch (e) {
           console.warn("[FurimaCopy] shipping method pick failed", e);
         }

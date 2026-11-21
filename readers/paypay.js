@@ -109,6 +109,10 @@
       node.deliveryMethod && typeof node.deliveryMethod.name === "string"
         ? node.deliveryMethod.name
         : null;
+    const methodId =
+      node.deliveryMethod && typeof node.deliveryMethod.id === "string"
+        ? node.deliveryMethod.id
+        : null;
     return {
       title: typeof node.title === "string" ? node.title : null,
       description: typeof node.description === "string" ? node.description : null,
@@ -118,6 +122,7 @@
       categoryText: cat || null,
       shippingText: methodName,
       shippingMethod: methodName,
+      shippingMethodId: methodId,
       shipDays: daysText(node.deliverySchedule && node.deliverySchedule.text),
       shipFrom:
         PREFECTURE_BY_CODE[String(node.location || "").toUpperCase()] || null,
