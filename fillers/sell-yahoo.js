@@ -336,9 +336,10 @@
     }
   }
 
-  // 配送方法ラジオ（name="shipmethod_dummy"）を名称で選ぶ。ラベルの先頭部分
-  // （価格表記の前）で照合し、候補が 1 つに定まる場合だけ押す。押せたかどうかは
-  // ラジオの checked で検証する。
+  // 配送方法ラジオ（name="shipmethod_dummy"）を名称で選ぶ。ラジオ自体からは
+  // 名称が読み取りにくい構造なので、方法名で始まる小さな表示要素を探して
+  // その行ごとクリックし、ラジオの checked で検証する。名称が完全に一致する
+  // 要素を優先し、候補が複数名称にまたがる場合は選ばない（誤選択防止）。
   function selectShipMethod(method) {
     const norm = (s) =>
       String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
@@ -347,34 +348,57 @@
     const radios = Array.from(
       document.querySelectorAll('input[type="radio"][name="shipmethod_dummy"]')
     );
-    const matches = [];
-    for (const r of radios) {
-      // このラジオだけを含む最小のラベル/コンテナをラベル文言の出所にする。
-      let wrap = r.closest("label") || r.parentElement;
-      for (let i = 0; i < 3 && wrap; i++) {
-        const inside = wrap.querySelectorAll('input[name="shipmethod_dummy"]');
-        if (inside.length <= 1) break;
-        wrap = wrap.parentElement;
+    if (!radios.length) return false;
+    const wasChecked = radios.map((r) => r.checked);
+    const namePartOf = (el) =>
+      norm(
+        ((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim()).split(
+          /全国一律|円/
+        )[0]
+      );
+    const all = Array.from(document.querySelectorAll("label, div, span, td, li, a"))
+      .filter((el) => {
+        if (!FF.isVisible(el)) return false;
+        const t = (el.innerText || "").replace(/\s+/g, " ").trim();
+        if (!t || t.length > 90) return false;
+        const np = namePartOf(el);
+        return np === target || np.startsWith(target);
+      })
+      .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
+    const exact = all.filter((el) => namePartOf(el) === target);
+    let pool = exact.length ? exact : all;
+    if (!exact.length) {
+      const distinct = new Set(pool.map((el) => namePartOf(el)));
+      if (distinct.size !== 1) {
+        console.log("[FurimaCopy] ship method ambiguous:", Array.from(distinct), "for", method);
+        return false;
       }
-      if (!wrap) continue;
-      const label = (wrap.innerText || wrap.textContent || "").replace(/\s+/g, " ").trim();
-      const namePart = norm(label.split(/全国一律|円/)[0]);
-      if (
-        namePart &&
-        (namePart === target || namePart.startsWith(target) || target.startsWith(namePart))
-      ) {
-        matches.push({ r, wrap });
+    }
+    for (const el of pool) {
+      // その要素を含む「ラジオ 1 つだけの行」をクリック対象にする。
+      let row = el;
+      for (let n = el; n && n !== document.body; n = n.parentElement) {
+        if (
+          n.querySelectorAll &&
+          n.querySelectorAll('input[name="shipmethod_dummy"]').length === 1
+        ) {
+          row = n;
+          break;
+        }
+      }
+      FF.clickLikeUser(row);
+      const nowChecked = radios.filter((r) => r.checked);
+      if (nowChecked.length === 1) {
+        const rowRadios = row.querySelectorAll
+          ? row.querySelectorAll('input[name="shipmethod_dummy"]')
+          : [];
+        if (rowRadios.length === 1 && rowRadios[0].checked) return true;
+        // 行とラジオを対応付けできない場合は、このクリックで新たに
+        // チェックが付いたこと自体を根拠にする。
+        if (!wasChecked[radios.indexOf(nowChecked[0])]) return true;
       }
     }
-    if (matches.length !== 1) {
-      console.log("[FurimaCopy] ship method candidates:", matches.length, "for", method);
-      return false;
-    }
-    FF.clickLikeUser(matches[0].wrap);
-    if (!matches[0].r.checked) {
-      try { matches[0].r.click(); } catch (e) { /* 下で検証する */ }
-    }
-    return matches[0].r.checked;
+    return false;
   }
 
   // 編集欄に実際に入った説明テキストを読み戻す（入力検証用）。
