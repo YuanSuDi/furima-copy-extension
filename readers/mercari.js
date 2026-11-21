@@ -80,6 +80,8 @@
       conditionText: conditionFromItem(item),
       categoryText: categoryFromItem(item),
       shippingText: shipping,
+      shippingPayer: payer || null,
+      shippingMethodName: method || null,
     };
   }
 
@@ -187,6 +189,15 @@
       shippingText:
         FC.dom.specValue(["配送料の負担", "配送の方法"]) ||
         specByLabelAny(["配送料の負担", "配送の方法"]),
+      // v0.12.12: 配送の内訳を構造化して保持する（出品フォームの自動選択用）。
+      shippingPayer:
+        FC.dom.specValue(["配送料の負担"]) || specByLabelAny(["配送料の負担"]),
+      shippingMethodName:
+        FC.dom.specValue(["配送の方法"]) || specByLabelAny(["配送の方法"]),
+      shipFrom:
+        FC.dom.specValue(["発送元の地域"]) || specByLabelAny(["発送元の地域"]),
+      shipDays:
+        FC.dom.specValue(["発送までの日数"]) || specByLabelAny(["発送までの日数"]),
     };
   }
 

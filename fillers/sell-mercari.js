@@ -145,11 +145,11 @@
   // 失敗時に別ページで後続の入力（状態・画像）が空振りするのを防ぐ。
   async function backToSellForm() {
     for (let i = 0; i < 4; i++) {
-      if (!/\/(categories|conditions)/.test(location.pathname)) return true;
+      if (!/\/(categories|conditions|shipping_methods)/.test(location.pathname)) return true;
       history.back();
       await sleepMs(1200);
     }
-    return !/\/(categories|conditions)/.test(location.pathname);
+    return !/\/(categories|conditions|shipping_methods)/.test(location.pathname);
   }
 
   // 戻り値: 成功したらフォームに実際に表示されたカテゴリパス、失敗したら false。
@@ -300,6 +300,147 @@
     const ok = !!conditionSelected(target);
     if (!ok) await backToSellForm();
     return ok;
+  }
+
+  // ---- 配送まわり（v0.12.12） ---------------------------------------------
+  // 従来は配送・送料を「手動」扱いにしていたため、管理タスクの自動出品が
+  // フォーム未選択（配送の方法・発送元の地域）に阻まれて失敗した（A351）。
+  // 同プラットフォーム複写では、読み取り側が保持した内訳（負担 / 方法 /
+  // 地域 / 日数）をそのまま再現する。成功は常にフォームの実表示で確認する。
+  // 括弧の全角・半角ゆれを吸収する比較用正規化。
+  const normShip = (s) =>
+    norm(s).replace(/（/g, "(").replace(/）/g, ")");
+
+  function selectValueOk(labelTexts, valueText) {
+    const sel = FF.findSelect(null, labelTexts);
+    if (!sel) return false;
+    const opt = sel.options[sel.selectedIndex];
+    return !!opt && normShip(opt.textContent) === normShip(valueText);
+  }
+
+  async function pickMercariSelect(labelTexts, valueText) {
+    if (!valueText) return false;
+    if (selectValueOk(labelTexts, valueText)) return true;
+    const sel = FF.findSelect(null, labelTexts);
+    if (!sel) return false;
+    try {
+      FF.trySelectByText(sel, [
+        valueText,
+        String(valueText).replace(/\(/g, "（").replace(/\)/g, "）"),
+        String(valueText).replace(/（/g, "(").replace(/）/g, ")"),
+      ]);
+    } catch (e) {
+      console.warn("[FurimaCopy] shipping select failed", e);
+    }
+    return selectValueOk(labelTexts, valueText);
+  }
+
+  function shippingMethodShown(target) {
+    const c = FF.fieldContainer(["配送の方法"]);
+    if (!c) return false;
+    const raw = normShip(c.textContent || "");
+    if (!raw || raw.includes(normShip("配送の方法を選択する"))) return false;
+    return raw.includes(normShip(target));
+  }
+
+  // 配送の方法ページのラジオを探す。カード型のラジオはラベル全体の
+  // 1 行目が方法名（バッジ語を除く）。「その他」内の行は名前そのもの。
+  function findShippingMethodRadio(target) {
+    const radios = Array.from(
+      document.querySelectorAll('input[type="radio"]')
+    ).filter((el) => FF.isVisible(el) || el.closest("label"));
+    for (const r of radios) {
+      const label = r.closest("label");
+      const card = label || r.parentElement;
+      if (!card) continue;
+      const lines = String(card.textContent || "")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const first = (lines[0] || "").replace(/匿名|追跡|補償/g, "");
+      if (normShip(first) === target || normShip(lines.join("")) === target) {
+        return label || r;
+      }
+    }
+    return null;
+  }
+
+  async function pickMercariShippingMethod(methodName) {
+    const target = normShip(methodName);
+    if (!target) return false;
+    if (shippingMethodShown(methodName)) return true;
+    const link = findPageLink("/sell/shipping_methods");
+    if (link) {
+      FF.clickLikeUser(link);
+    } else {
+      const container = FF.fieldContainer(["配送の方法"]);
+      const trigger =
+        container &&
+        (pickTrigger(container, "/sell/shipping_methods") || container);
+      if (!trigger || !isSafeTrigger(trigger)) return false;
+      FF.clickLikeUser(trigger);
+    }
+    let hit = await FF.waitFor(
+      () => findShippingMethodRadio(target),
+      8000,
+      250
+    );
+    if (!hit && /shipping_methods/.test(location.pathname)) {
+      const expander = FF.findClickableByText("その他");
+      if (expander) {
+        FF.clickLikeUser(expander);
+        hit = await FF.waitFor(
+          () => findShippingMethodRadio(target),
+          4000,
+          250
+        );
+      }
+    }
+    if (!hit) {
+      await backToSellForm();
+      return false;
+    }
+    FF.clickLikeUser(hit);
+    const upd = await FF.waitFor(
+      () => FF.findClickableByText("更新する"),
+      4000,
+      250
+    );
+    if (upd) FF.clickLikeUser(upd);
+    const ok = await FF.waitFor(
+      () => shippingMethodShown(methodName),
+      6000,
+      250
+    );
+    if (!ok) await backToSellForm();
+    return !!ok;
+  }
+
+  // 4 項目を試み、{ parts: 成功した表示, missing: 失敗・欠落した項目名 } を返す。
+  async function fillMercariShipping(data) {
+    const parts = [];
+    const missing = [];
+    const tries = [
+      ["配送料の負担", data.shippingPayer, () => pickMercariSelect(["配送料の負担"], data.shippingPayer)],
+      ["配送の方法", data.shippingMethodName, () => pickMercariShippingMethod(data.shippingMethodName)],
+      ["発送元の地域", data.shipFrom, () => pickMercariSelect(["発送元の地域"], data.shipFrom)],
+      ["発送までの日数", data.shipDays, () => pickMercariSelect(["発送までの日数"], data.shipDays)],
+    ];
+    for (const [label, value, fn] of tries) {
+      if (!value) {
+        missing.push(label + "（読み取りなし）");
+        continue;
+      }
+      let ok = false;
+      try {
+        ok = await fn();
+      } catch (e) {
+        console.warn("[FurimaCopy] shipping pick failed: " + label, e);
+      }
+      if (ok) parts.push(label + ": " + value);
+      else missing.push(label);
+    }
+    return { parts, missing };
   }
 
   async function handleFill() {
@@ -472,11 +613,36 @@
     }
     await fillImages();
 
-    lines.push({
-      label: "配送・送料",
-      status: "manual",
-      note: "手動" + (data.shippingText ? "（候補： " + data.shippingText + "）" : "で選択してください"),
-    });
+    if (
+      samePlatform &&
+      (data.shippingPayer || data.shippingMethodName || data.shipFrom || data.shipDays)
+    ) {
+      const ship = await fillMercariShipping(data);
+      if (!ship.missing.length) {
+        lines.push({
+          label: "配送・送料",
+          status: "ok",
+          note: ship.parts.join(" / "),
+        });
+      } else {
+        lines.push({
+          label: "配送・送料",
+          // 管理タスクでは未設定を fail にして自動送信ガードに止めさせる。
+          status: data.managerTask ? "fail" : "manual",
+          note:
+            (ship.parts.length ? ship.parts.join(" / ") + " / " : "") +
+            "未設定: " +
+            ship.missing.join(", ") +
+            (data.shippingText ? "（候補: " + data.shippingText + "）" : ""),
+        });
+      }
+    } else {
+      lines.push({
+        label: "配送・送料",
+        status: "manual",
+        note: "手動" + (data.shippingText ? "（候補： " + data.shippingText + "）" : "で選択してください"),
+      });
+    }
 
     lines.push({
       label: "送信前確認",
