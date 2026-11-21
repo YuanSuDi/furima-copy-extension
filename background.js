@@ -1785,6 +1785,8 @@ async function inspectAndAdvanceYahooRelist(
         "出品を確定する",
         "上記のガイドライン、規約、情報提供等に同意して出品する",
         "上記のガイドライン、規約、情報提供等に同意して 出品する",
+        "ガイドラインと上記規約等に同意して 出品する",
+        "ガイドラインと上記規約等に同意して出品する",
       ]);
       const reviewLabels = new Set([
         "確認する",
@@ -1793,6 +1795,12 @@ async function inspectAndAdvanceYahooRelist(
         "出品する",
         "再出品する",
       ]);
+      // 確認ページの最終ボタンは文言のバリエーションがある（実例:
+      // 「ガイドラインと上記規約等に同意して 出品する」）。ガイドライン
+      // 同意に触れていて「出品する」で終わるラベルも最終送信とみなす。
+      const isFinalLabel = (label) =>
+        finalLabels.has(label) ||
+        (label.includes("ガイドライン") && label.endsWith("出品する"));
       const scope =
         document.querySelector("main") ||
         document.querySelector('[role="main"]') ||
@@ -1800,17 +1808,30 @@ async function inspectAndAdvanceYahooRelist(
       if (!scope) {
         return { status: "pending" };
       }
-      const controls = Array.from(
-        scope.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]')
-      ).filter((el) => {
-        const style = getComputedStyle(el);
-        return style.display !== "none" && style.visibility !== "hidden" && el.getClientRects().length > 0;
-      });
-      const matches = controls
-        .map((el) => ({ el, label: visibleText(el) }))
-        .filter(({ label }) =>
-          isPreviewPage ? finalLabels.has(label) : reviewLabels.has(label)
+      const listControls = (root) =>
+        Array.from(
+          root.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]')
+        )
+          .filter((el) => {
+            const style = getComputedStyle(el);
+            return style.display !== "none" && style.visibility !== "hidden" && el.getClientRects().length > 0;
+          })
+          .map((el) => ({ el, label: visibleText(el) }));
+      const pickMatches = (labeled) =>
+        labeled.filter(({ label }) =>
+          isPreviewPage ? isFinalLabel(label) : reviewLabels.has(label)
         );
+      let labeledControls = listControls(scope);
+      let matches = pickMatches(labeledControls);
+      if (!matches.length && document.body && scope !== document.body) {
+        // main スコープの外にボタンがあるページバリエーション向けの保険。
+        const bodyControls = listControls(document.body);
+        const bodyMatches = pickMatches(bodyControls);
+        if (bodyMatches.length) {
+          labeledControls = bodyControls;
+          matches = bodyMatches;
+        }
+      }
       const previousClick =
         window.__fcYahooRelistClickedFor === itemId
           ? window.__fcYahooRelistClickedKind
@@ -1818,7 +1839,7 @@ async function inspectAndAdvanceYahooRelist(
       if (previousClick === "submit") return { status: "pending" };
       if (
         previousClick === "review" &&
-        !matches.some(({ label }) => isPreviewPage && finalLabels.has(label))
+        !matches.some(({ label }) => isPreviewPage && isFinalLabel(label))
       ) {
         return { status: "pending" };
       }
@@ -1828,7 +1849,7 @@ async function inspectAndAdvanceYahooRelist(
           error: matches.length
             ? "出品操作ボタンを一意に特定できませんでした"
             : "安全に押せる再出品ボタンが見つかりませんでした（可见操作：" +
-              controls.map(({ label }) => label).filter(Boolean).slice(0, 8).join(" / ") +
+              labeledControls.map(({ label }) => label).filter(Boolean).slice(0, 8).join(" / ") +
               "）",
         };
       }
@@ -2104,7 +2125,14 @@ async function processYahooRelistItem(tabId, item) {
         "送信後に出品中一覧で再出品を確認できませんでした。重複送信を避けるため処理を停止しました"
       );
     }
-    if (page.status === "error") throw new Error(page.error || "再出品ページを確認できませんでした");
+    if (page.status === "error") {
+      // 描画直後でボタンがまだ無い等の一過性エラーは、数回だけ待って再試行する。
+      if (attempt < 4 && /見つかりませんでした/.test(page.error || "")) {
+        await remoteSleep(2000);
+        continue;
+      }
+      throw new Error(page.error || "再出品ページを確認できませんでした");
+    }
     if (page.status === "clicked") {
       if (page.kind === "submit") finalSubmitClicked = true;
       else reviewClicks++;
