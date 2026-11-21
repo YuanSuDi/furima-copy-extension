@@ -6,6 +6,11 @@
 // 切断され、表組みも潰れる）。説明文はページの説明ブロックから全文を取り、DOM 側が長ければ
 // そちらを優先する。あわせて説明ブロックの HTML（危険な要素を除いたもの）を descriptionHtml
 // として保存し、Yahoo!→Yahoo! のコピーでは書式ごと再現できるようにする。
+// 注意（v0.12.6）: 現在の Yahoo! 商品ページでは、表示されている説明ブロック（#description）
+// 自体が末尾「...」で切れた要約（実測 235 字）しか持っていない。売り手の全文はページ埋め込みの
+// 状態 JSON の descriptionHtml（実測 992 字）にだけあるため、そちらを最優先で使う。
+// あわせて状態 JSON の shipping.methods から配送方法名も拾い、フォーム自動選択用に
+// 送料負担・発送元・発送日数を構造化して保存する。
 (() => {
   "use strict";
   const FC = window.FurimaCopy;
@@ -34,28 +39,53 @@
     '[id*="description"]',
   ];
 
-  // ページ上の「商品の説明」ブロック要素を探す。セレクタで見つからなければ
-  // 「商品の説明」という見出しから親をたどる。
+  // ページ上の「商品の説明」ブロック要素を探す。候補をすべて集め、末尾が
+  // 「...」で切れた要約ブロック（#description 等）を避けて最長のものを返す。
   function findExplanationEl() {
+    const candidates = [];
     for (const sel of EXPLANATION_SELECTORS) {
-      const el = document.querySelector(sel);
-      if (el && (el.textContent || "").trim().length > 20) return el;
+      document.querySelectorAll(sel).forEach((el) => {
+        if ((el.textContent || "").trim().length > 20) candidates.push(el);
+      });
     }
     const heads = Array.from(document.querySelectorAll("h1, h2, h3, h4, dt, th, span, div, p"));
-    const head = heads.find((h) => (h.textContent || "").trim() === "商品の説明");
+    const head = heads.find((h) => {
+      const t = (h.textContent || "").trim();
+      return t === "商品の説明" || t === "商品説明";
+    });
     if (head) {
       let node = head;
       for (let i = 0; i < 3 && node; i++) {
         node = node.parentElement;
-        if (node && (node.textContent || "").trim().length > 100) return node;
+        if (node && (node.textContent || "").trim().length > 100) {
+          candidates.push(node);
+          break;
+        }
       }
     }
-    return null;
+    if (!candidates.length) return null;
+    const isTruncated = (el) => /\.\.\.$|…$/.test((el.textContent || "").trim());
+    const full = candidates.filter((el) => !isTruncated(el));
+    const pool = full.length ? full : candidates;
+    pool.sort((a, b) => (b.textContent || "").length - (a.textContent || "").length);
+    return pool[0];
+  }
+
+  // 説明ブロック内の Yahoo! 側の見出し（商品説明 / 商品の説明）と、隠れた
+  // 重複ブロック（表示切替用など）を取り除く。
+  function stripExplanationChrome(clone) {
+    clone.querySelectorAll("h1, h2, h3, h4").forEach((h) => {
+      if (/^商品の?説明$/.test((h.textContent || "").trim())) h.remove();
+    });
+    clone
+      .querySelectorAll('[style*="display:none"], [style*="display: none"], [hidden]')
+      .forEach((n) => n.remove());
   }
 
   // 説明ブロックを読みやすいプレーンテキスト化する（表は行ごとに改行、セルは空白区切り）。
   function readableText(el) {
     const clone = el.cloneNode(true);
+    stripExplanationChrome(clone);
     clone.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
     clone.querySelectorAll("td, th").forEach((c) => c.append(" "));
     clone
@@ -72,6 +102,7 @@
   // 説明ブロックの HTML を、スクリプト等の危険な要素・属性を取り除いて返す。
   function sanitizedHtml(el) {
     const clone = el.cloneNode(true);
+    stripExplanationChrome(clone);
     clone
       .querySelectorAll("script, style, iframe, object, embed, form, input, button, link, meta")
       .forEach((n) => n.remove());
@@ -124,6 +155,91 @@
     return null;
   }
 
+  // ページ埋め込みの状態 JSON から、売り手の説明 HTML 全文と配送方法名を拾う。
+  // 表示ブロックも JSON-LD も要約しか持っていないため、これが取れれば最優先。
+  function extractFromPageState() {
+    let descHtml = null;
+    let shipMethod = null;
+    try {
+      for (const s of document.querySelectorAll("script")) {
+        const t = s.textContent || "";
+        if (!descHtml && t.includes('"descriptionHtml"')) {
+          const m = t.match(/"descriptionHtml":"((?:[^"\\]|\\.)*)"/);
+          if (m) {
+            try { descHtml = JSON.parse('"' + m[1] + '"'); } catch (e) { descHtml = null; }
+          }
+        }
+        if (!shipMethod && t.includes('"methods"')) {
+          const m = t.match(/"shipping":\{"methods":\[\{"id":"[^"]*","name":"((?:[^"\\]|\\.)*)"/);
+          if (m) {
+            try { shipMethod = JSON.parse('"' + m[1] + '"'); } catch (e) { shipMethod = null; }
+          }
+        }
+        if (descHtml && shipMethod) break;
+      }
+    } catch (e) {
+      /* 状態 JSON が無いページでは DOM 抽出に任せる */
+    }
+    return { descHtml, shipMethod };
+  }
+
+  function htmlToReadableText(html) {
+    const div = document.createElement("div");
+    div.innerHTML = html;
+    return readableText(div);
+  }
+
+  function sanitizeHtmlString(html) {
+    const div = document.createElement("div");
+    div.innerHTML = html;
+    return sanitizedHtml(div);
+  }
+
+  // 配送方法の既知名称（長い順に並べ、最長一致で拾う）。
+  const SHIP_METHOD_NAMES = [
+    "ゆうパケットポストmini", "ゆうパケットプラス", "レターパックプラス",
+    "レターパックライト", "宅急便コンパクト", "クリックポスト",
+    "ゆうパケット", "定形外郵便", "ゆうメール", "ゆうパック",
+    "定形郵便", "ネコポス", "飛脚宅配便", "宅急便",
+  ];
+  function matchShipMethod(text) {
+    if (!text) return null;
+    for (const name of SHIP_METHOD_NAMES) {
+      if (String(text).includes(name)) return name;
+    }
+    return null;
+  }
+
+  // フォーム自動選択用に、配送まわりを構造化して拾う。
+  function shippingFromDom() {
+    const feeText = FC.dom.specValue(["送料"]);
+    let burden = null;
+    if (feeText) {
+      if (/無料/.test(feeText)) burden = "seller";
+      else if (/着払い|落札者/.test(feeText)) burden = "buyer";
+      else if (/出品者/.test(feeText)) burden = "seller";
+    }
+    const from = FC.dom.specValue(["発送元の地域", "発送元"]);
+    const daysText = FC.dom.specValue(["発送までの日数"]);
+    let days = null;
+    if (daysText) {
+      const m = String(daysText).match(/(\d+)\s*[〜～~]\s*(\d+)\s*日/);
+      if (m) days = m[1] + "〜" + m[2] + "日";
+    }
+    // 送料の値セルには配送方法名も連結されて入っていることがある（実測）。
+    let method =
+      matchShipMethod(feeText) || matchShipMethod(FC.dom.specValue(["配送方法"]));
+    if (!method) {
+      const areas = Array.from(document.querySelectorAll("div, section, td, li"));
+      const area = areas.find((el) => {
+        const t = el.textContent || "";
+        return t.includes("配送方法一覧") && t.length < 600;
+      });
+      if (area) method = matchShipMethod(area.textContent);
+    }
+    return { burden, from: from || null, days, method };
+  }
+
   function extractFromDom() {
     const explEl = findExplanationEl();
     const imgs = [];
@@ -149,6 +265,7 @@
       FC.dom.text(['[class*="Price"]', '[class*="price"]']) ||
       FC.dom.specValue(["現在価格", "即決価格", "価格"]);
 
+    const shipInfo = shippingFromDom();
     return {
       title: FC.dom.text(["h1"]) || FC.dom.meta("og:title"),
       description: explEl ? readableText(explEl) : FC.dom.text(EXPLANATION_SELECTORS),
@@ -158,6 +275,10 @@
       conditionText: FC.dom.specValue(["商品の状態", "状態"]),
       categoryText: categoryFromDom() || FC.dom.specValue(["カテゴリー", "カテゴリ"]),
       shippingText: FC.dom.specValue(["送料", "配送", "発送"]),
+      shippingMethod: shipInfo.method,
+      shippingBurden: shipInfo.burden,
+      shipFrom: shipInfo.from,
+      shipDays: shipInfo.days,
     };
   }
 
@@ -178,6 +299,16 @@
       data.description = domData.description;
     }
     if (domData.descriptionHtml) data.descriptionHtml = domData.descriptionHtml;
+    // ページ状態 JSON に全文の説明 HTML と配送方法があれば、それを正とする
+    // （表示ブロックと JSON-LD は末尾が切れた要約しか持っていないため）。
+    const state = extractFromPageState();
+    if (state.descHtml) {
+      const stateText = htmlToReadableText(state.descHtml);
+      const cleanHtml = sanitizeHtmlString(state.descHtml);
+      if (stateText) data.description = stateText;
+      if (cleanHtml) data.descriptionHtml = cleanHtml;
+    }
+    if (state.shipMethod) data.shippingMethod = state.shipMethod;
     const saved = await FC.save(
       Object.assign({}, data, { source: "yahoo", sourceUrl: location.href })
     );
