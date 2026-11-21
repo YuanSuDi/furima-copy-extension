@@ -73,6 +73,28 @@
     }
   }
 
+  const PREFECTURE_BY_CODE = {
+    HOKKAIDO: "北海道", AOMORI: "青森県", IWATE: "岩手県", MIYAGI: "宮城県",
+    AKITA: "秋田県", YAMAGATA: "山形県", FUKUSHIMA: "福島県", IBARAKI: "茨城県",
+    TOCHIGI: "栃木県", GUNMA: "群馬県", SAITAMA: "埼玉県", CHIBA: "千葉県",
+    TOKYO: "東京都", KANAGAWA: "神奈川県", NIIGATA: "新潟県", TOYAMA: "富山県",
+    ISHIKAWA: "石川県", FUKUI: "福井県", YAMANASHI: "山梨県", NAGANO: "長野県",
+    GIFU: "岐阜県", SHIZUOKA: "静岡県", AICHI: "愛知県", MIE: "三重県",
+    SHIGA: "滋賀県", KYOTO: "京都府", OSAKA: "大阪府", HYOGO: "兵庫県",
+    NARA: "奈良県", WAKAYAMA: "和歌山県", TOTTORI: "鳥取県", SHIMANE: "島根県",
+    OKAYAMA: "岡山県", HIROSHIMA: "広島県", YAMAGUCHI: "山口県", TOKUSHIMA: "徳島県",
+    KAGAWA: "香川県", EHIME: "愛媛県", KOCHI: "高知県", FUKUOKA: "福岡県",
+    SAGA: "佐賀県", NAGASAKI: "長崎県", KUMAMOTO: "熊本県", OITA: "大分県",
+    MIYAZAKI: "宮崎県", KAGOSHIMA: "鹿児島県", OKINAWA: "沖縄県",
+  };
+
+  // "1〜2日で発送" → "1〜2日"（フォームの select 表記に合わせた素の形）
+  function daysText(text) {
+    if (typeof text !== "string") return null;
+    const m = text.match(/(\d+)\s*[〜～~]\s*(\d+)\s*日/);
+    return m ? m[1] + "〜" + m[2] + "日" : null;
+  }
+
   function fromItemNode(node) {
     if (!node) return null;
     const imageUrls = [];
@@ -83,6 +105,10 @@
     const cat = Array.isArray(node.categoryList)
       ? node.categoryList.map((c) => c && c.name).filter(Boolean).join(" > ")
       : null;
+    const methodName =
+      node.deliveryMethod && typeof node.deliveryMethod.name === "string"
+        ? node.deliveryMethod.name
+        : null;
     return {
       title: typeof node.title === "string" ? node.title : null,
       description: typeof node.description === "string" ? node.description : null,
@@ -90,7 +116,11 @@
       imageUrls,
       conditionText: node.condition && typeof node.condition.text === "string" ? node.condition.text : null,
       categoryText: cat || null,
-      shippingText: node.deliveryMethod && typeof node.deliveryMethod.name === "string" ? node.deliveryMethod.name : null,
+      shippingText: methodName,
+      shippingMethod: methodName,
+      shipDays: daysText(node.deliverySchedule && node.deliverySchedule.text),
+      shipFrom:
+        PREFECTURE_BY_CODE[String(node.location || "").toUpperCase()] || null,
     };
   }
 
@@ -122,6 +152,9 @@
       conditionText: FC.dom.specValue(["商品の状態", "状態"]),
       categoryText: FC.dom.specValue(["カテゴリー", "カテゴリ"]),
       shippingText: FC.dom.specValue(["送料", "配送", "発送"]),
+      shippingMethod: FC.dom.specValue(["配送の方法", "配送方法"]),
+      shipFrom: FC.dom.specValue(["発送元の地域"]),
+      shipDays: daysText(FC.dom.specValue(["発送までの日数"])),
     };
   }
 

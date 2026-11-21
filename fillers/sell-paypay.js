@@ -114,7 +114,7 @@
     return null;
   }
 
-  const OTHER_LABELS = ["カテゴリ", "商品の状態", "配送", "送料", "価格", "商品名", "商品説明", "商品の説明"];
+  const OTHER_LABELS = ["カテゴリ", "商品の状態", "配送", "配送方法", "発送までの日数", "発送元の地域", "送料", "価格", "商品名", "商品説明", "商品の説明"];
 
   // フォームの値ボックスに表示されている値。未選択なら null。
   function fieldValue(labelText) {
@@ -405,6 +405,90 @@
     return !!ok;
   }
 
+  // ---- 配送（v0.12.8） ---------------------------------------------------
+  // フォームには配送方法（おてがる配送（日本郵便））、発送までの日数（2~3日）、
+  // 発送元の地域（東京都）が既定で選択済みのため、「未選択のときだけ埋める」
+  // 方式ではコピー元の値に直らない。値が入っていても必ずコピー元へ合わせ、
+  // 成功判定は実際の選択状態（radio の checked / select の選択中 option）で行う。
+  const tildeNorm = (s) => norm(s).replace(/[〜～]/g, "~");
+
+  // 配送方法の選択肢: radio をちょうど1つ含み、テキストが方法名で始まる要素。
+  // 名前ごとに最小の要素（他の候補を内包しないもの）を残す。
+  function shippingMethodOptions() {
+    const byName = new Map();
+    for (const el of document.querySelectorAll("label, div, li, section")) {
+      if (!FF.isVisible(el) || !onScreen(el)) continue;
+      const radios = el.querySelectorAll('input[type="radio"]');
+      if (radios.length !== 1) continue;
+      const m = norm(el.textContent).match(/^(おてがる配送（[^）]+）)/);
+      if (!m) continue;
+      const name = m[1];
+      const prev = byName.get(name);
+      if (!prev || (prev.container !== el && prev.container.contains(el))) {
+        byName.set(name, { name, container: el, radio: radios[0] });
+      }
+    }
+    return Array.from(byName.values());
+  }
+
+  async function pickPaypayShippingMethod(methodText) {
+    const target = norm(methodText);
+    if (!target) return false;
+    const findTarget = () =>
+      shippingMethodOptions().find((o) => norm(o.name) === target) || null;
+    let opt = findTarget();
+    if (opt && opt.radio.checked) return true;
+    if (!opt) {
+      // 選択肢が閉じている場合は配送方法の行を押して展開する。
+      const sec = fieldSection("配送方法");
+      if (sec) {
+        const inner = Array.from(
+          sec.section.querySelectorAll("div, span, p, button, a")
+        )
+          .filter(FF.isVisible)
+          .filter((el) => norm(el.textContent).includes("おてがる配送"))
+          .sort((a, b) => a.textContent.length - b.textContent.length)[0];
+        FF.clickLikeUser(inner || sec.section);
+      }
+      opt = await FF.waitFor(findTarget, 3000, 250);
+      if (!opt) return false;
+      if (opt.radio.checked) return true;
+    }
+    FF.clickLikeUser(opt.radio);
+    let ok = await FF.waitFor(
+      () => {
+        const o = findTarget();
+        return !!(o && o.radio.checked);
+      },
+      3000,
+      200
+    );
+    if (!ok) {
+      // radio 自体で受けない場合は選択肢の要素ごと押す。
+      FF.clickLikeUser(opt.container);
+      ok = await FF.waitFor(
+        () => {
+          const o = findTarget();
+          return !!(o && o.radio.checked);
+        },
+        3000,
+        200
+      );
+    }
+    return !!ok;
+  }
+
+  // 発送までの日数 / 発送元の地域（ネイティブ select）。選択後の option で検証する。
+  async function pickPaypaySelect(labelText, valueText, extraCandidates) {
+    if (!valueText) return false;
+    const sel = FF.findSelect([], [labelText]);
+    if (!sel) return false;
+    const cands = [valueText].concat(extraCandidates || []);
+    if (!FF.trySelectByText(sel, cands)) return false;
+    const cur = sel.options[sel.selectedIndex];
+    return !!(cur && tildeNorm(cur.textContent) === tildeNorm(valueText));
+  }
+
   async function handleFill() {
     const data = await FC.load();
     if (!data) {
@@ -523,11 +607,61 @@
         note: "手動" + (data.conditionText ? "（候補： " + data.conditionText + "）" : "で選択してください"),
       });
     }
-    lines.push({
-      label: "配送・送料",
-      status: "manual",
-      note: "手動" + (data.shippingText ? "（候補： " + data.shippingText + "）" : "で選択してください"),
-    });
+    // 配送まわり: 同プラットフォーム複写ではコピー元の値に必ず合わせる
+    // （フォームの既定値が入っていても上書きする。v0.12.8）。
+    if (samePlatform) {
+      const method = data.shippingMethod || data.shippingText;
+      if (method) {
+        let ok = false;
+        try {
+          ok = await pickPaypayShippingMethod(method);
+        } catch (e) {
+          console.warn("[FurimaCopy] shipping method pick failed", e);
+        }
+        lines.push({
+          label: "配送方法",
+          status: ok ? "ok" : "manual",
+          note: ok ? method : "自動選択できませんでした（候補： " + method + "）",
+        });
+      } else {
+        lines.push({ label: "配送方法", status: "manual", note: "手動で選択してください" });
+      }
+      if (data.shipDays) {
+        let ok = false;
+        try {
+          ok = await pickPaypaySelect("発送までの日数", data.shipDays, [
+            data.shipDays.replace(/〜/g, "~"),
+            data.shipDays.replace(/〜/g, "～"),
+          ]);
+        } catch (e) {
+          console.warn("[FurimaCopy] ship days select failed", e);
+        }
+        lines.push({
+          label: "発送までの日数",
+          status: ok ? "ok" : "manual",
+          note: ok ? data.shipDays : "自動選択できませんでした（候補： " + data.shipDays + "）",
+        });
+      }
+      if (data.shipFrom) {
+        let ok = false;
+        try {
+          ok = await pickPaypaySelect("発送元の地域", data.shipFrom);
+        } catch (e) {
+          console.warn("[FurimaCopy] ship from select failed", e);
+        }
+        lines.push({
+          label: "発送元の地域",
+          status: ok ? "ok" : "manual",
+          note: ok ? data.shipFrom : "自動選択できませんでした（候補： " + data.shipFrom + "）",
+        });
+      }
+    } else {
+      lines.push({
+        label: "配送・送料",
+        status: "manual",
+        note: "手動" + (data.shippingText ? "（候補： " + data.shippingText + "）" : "で選択してください"),
+      });
+    }
 
     lines.push({
       label: "送信前確認",
