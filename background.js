@@ -655,6 +655,10 @@ async function releaseManagerTask(cfg, task, reason) {
 // Mercari 商品ページで「自分の商品か」を判定する。
 // 出品者向けコントロール（商品の編集 / 出品を一時停止 等）が見えていること
 // を肯定的な証拠とし、見えなければ他人の商品として扱う（fail-closed）。
+// v0.12.11: 売却済みページには編集/一時停止ボタンが存在しないため、従来の
+// 判定では「自分の売れた商品」が永遠に所有権なしになっていた。売却済み
+// ページでは取引当事者にしか見えない「取引画面を表示する」リンクを
+// 出品者側の証拠として扱う（購入手続きボタンが無いことも確認する）。
 async function probeMercariOwnership(tabId) {
   let last = { isOwner: false, sellerSignals: [], buyerSignals: [] };
   for (let i = 0; i < 5; i++) {
@@ -680,9 +684,23 @@ async function probeMercariOwnership(tabId) {
             /出品を一時停止|一時停止する|商品の編集/.test(t)
           );
           const buyerSignals = texts.filter((t) => /購入手続き|購入に進む/.test(t));
+          const bodyHead = String(
+            (document.body && document.body.innerText) || ""
+          ).slice(0, 6000);
+          const soldOut = /売り切れ/.test(bodyHead);
+          const txSignals = texts.filter((t) => /取引画面を表示する/.test(t));
+          const soldOwner =
+            soldOut && txSignals.length > 0 && buyerSignals.length === 0;
           return {
-            isOwner: sellerSignals.length > 0,
+            isOwner: sellerSignals.length > 0 || soldOwner,
+            via:
+              sellerSignals.length > 0
+                ? "active-controls"
+                : soldOwner
+                  ? "sold-transaction"
+                  : null,
             sellerSignals: sellerSignals.slice(0, 3),
+            txSignals: txSignals.slice(0, 3),
             buyerSignals: buyerSignals.slice(0, 3),
           };
         },
