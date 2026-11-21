@@ -442,10 +442,33 @@
     if (!radio0) return false;
     if (radio0.checked) return true;
     const boxOf = (r) => r && (r.closest("label") || r.closest("li") || r.parentElement);
-    const isShown = (r) => !!(r && FF.isVisible(boxOf(r) || r));
-    let radio = radio0;
-    if (!isShown(radio)) {
-      // 選択肢が閉じている場合は配送方法の行を押して展開する。
+    const verified = (ms) =>
+      FF.waitFor(
+        () => {
+          const r = paypayShippingRadio(data);
+          return !!(r && r.checked);
+        },
+        ms || 2000,
+        200
+      );
+    // v0.12.10: 合成イベント（dispatchEvent）ではこのフォームの radio が
+    // 反応しないことが実測で判明した（展開はするが checked にならない。
+    // 本物のクリックでは即座に切り替わる）。要素のネイティブ click() は
+    // ブラウザの activation behavior を通るため、まずそれを使う。
+    const nativeClick = (el) => {
+      if (!el) return;
+      try {
+        el.click();
+      } catch (e) {
+        /* 次の手段へ */
+      }
+    };
+    // 1) radio 自体のネイティブ click（閉じた状態でも効くことがある）。
+    nativeClick(radio0);
+    if (await verified()) return true;
+    // 2) 選択肢が見えていなければ行を押して展開し、label のネイティブ click。
+    let radio = paypayShippingRadio(data) || radio0;
+    if (!FF.isVisible(boxOf(radio) || radio)) {
       const sec = fieldSection("配送方法");
       if (sec) {
         const inner = Array.from(
@@ -455,39 +478,27 @@
           .filter((el) => norm(el.textContent).includes("おてがる配送"))
           .sort((a, b) => a.textContent.length - b.textContent.length)[0];
         FF.clickLikeUser(inner || sec.section);
+        await FF.waitFor(
+          () => {
+            const r = paypayShippingRadio(data);
+            return r && FF.isVisible(boxOf(r) || r) ? r : null;
+          },
+          3000,
+          250
+        );
+        radio = paypayShippingRadio(data) || radio;
+        if (radio.checked) return true;
       }
-      radio = await FF.waitFor(
-        () => {
-          const r = paypayShippingRadio(data);
-          return r && isShown(r) ? r : null;
-        },
-        3000,
-        250
-      );
-      if (!radio) return false;
-      if (radio.checked) return true;
     }
-    const verified = () =>
-      FF.waitFor(
-        () => {
-          const r = paypayShippingRadio(data);
-          return !!(r && r.checked);
-        },
-        2500,
-        200
-      );
-    // 本命は選択肢全体を包む <label> を押すこと（radio へのネイティブ連動＋
-    // React の変更検知の両方に届く）。駄目なら見出し、最後に radio 自体。
-    FF.clickLikeUser(boxOf(radio) || radio);
+    nativeClick(boxOf(radio));
     if (await verified()) return true;
-    const box = boxOf(radio);
-    const heading = box && box.querySelector("h3, h2");
-    if (heading) {
-      FF.clickLikeUser(heading);
-      if (await verified()) return true;
-    }
-    FF.clickLikeUser(radio);
-    return !!(await verified());
+    nativeClick(paypayShippingRadio(data));
+    if (await verified()) return true;
+    // 3) 最後の保険として従来の合成イベント。
+    FF.clickLikeUser(boxOf(paypayShippingRadio(data)) || radio);
+    if (await verified(1500)) return true;
+    FF.clickLikeUser(paypayShippingRadio(data) || radio);
+    return !!(await verified(1500));
   }
 
   // 発送までの日数 / 発送元の地域（ネイティブ select）。選択後の option で検証する。
@@ -621,50 +632,61 @@
     }
     // 配送まわり: 同プラットフォーム複写ではコピー元の値に必ず合わせる
     // （フォームの既定値が入っていても上書きする。v0.12.8）。
+    // 実行順は select（日数・地域）→ 配送方法の順にする: 配送方法の選択後に
+    // 別の再描画が走って radio の状態が巻き戻る事故を避けるため（v0.12.10）。
     if (samePlatform) {
       const method = data.shippingMethod || data.shippingText;
-      if (method) {
-        let ok = false;
-        try {
-          ok = await pickPaypayShippingMethod(data);
-        } catch (e) {
-          console.warn("[FurimaCopy] shipping method pick failed", e);
-        }
-        lines.push({
-          label: "配送方法",
-          status: ok ? "ok" : "manual",
-          note: ok ? method : "自動選択できませんでした（候補： " + method + "）",
-        });
-      } else {
-        lines.push({ label: "配送方法", status: "manual", note: "手動で選択してください" });
-      }
+      let daysOk = null;
+      let fromOk = null;
+      let methodOk = null;
       if (data.shipDays) {
-        let ok = false;
         try {
-          ok = await pickPaypaySelect("発送までの日数", data.shipDays, [
+          daysOk = await pickPaypaySelect("発送までの日数", data.shipDays, [
             data.shipDays.replace(/〜/g, "~"),
             data.shipDays.replace(/〜/g, "～"),
           ]);
         } catch (e) {
           console.warn("[FurimaCopy] ship days select failed", e);
+          daysOk = false;
         }
+      }
+      if (data.shipFrom) {
+        try {
+          fromOk = await pickPaypaySelect("発送元の地域", data.shipFrom);
+        } catch (e) {
+          console.warn("[FurimaCopy] ship from select failed", e);
+          fromOk = false;
+        }
+      }
+      if (method) {
+        try {
+          methodOk = await pickPaypayShippingMethod(data);
+        } catch (e) {
+          console.warn("[FurimaCopy] shipping method pick failed", e);
+          methodOk = false;
+        }
+      }
+      if (method) {
+        lines.push({
+          label: "配送方法",
+          status: methodOk ? "ok" : "manual",
+          note: methodOk ? method : "自動選択できませんでした（候補： " + method + "）",
+        });
+      } else {
+        lines.push({ label: "配送方法", status: "manual", note: "手動で選択してください" });
+      }
+      if (data.shipDays) {
         lines.push({
           label: "発送までの日数",
-          status: ok ? "ok" : "manual",
-          note: ok ? data.shipDays : "自動選択できませんでした（候補： " + data.shipDays + "）",
+          status: daysOk ? "ok" : "manual",
+          note: daysOk ? data.shipDays : "自動選択できませんでした（候補： " + data.shipDays + "）",
         });
       }
       if (data.shipFrom) {
-        let ok = false;
-        try {
-          ok = await pickPaypaySelect("発送元の地域", data.shipFrom);
-        } catch (e) {
-          console.warn("[FurimaCopy] ship from select failed", e);
-        }
         lines.push({
           label: "発送元の地域",
-          status: ok ? "ok" : "manual",
-          note: ok ? data.shipFrom : "自動選択できませんでした（候補： " + data.shipFrom + "）",
+          status: fromOk ? "ok" : "manual",
+          note: fromOk ? data.shipFrom : "自動選択できませんでした（候補： " + data.shipFrom + "）",
         });
       }
     } else {
