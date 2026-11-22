@@ -67,6 +67,7 @@
     "ゆうゆうメルカリ便",
     "レターパックプラス",
     "レターパックライト",
+    "郵便（定形、定形外、書留など）",
     "普通郵便（定形、定形外）",
     "たのメル便",
     "クロネコヤマト",
@@ -78,9 +79,22 @@
     "普通郵便",
     "未定",
   ];
+
+  // 選択ページの表記と商品ページの表記が違う方法の正規化。
+  // 郵便: 選択ページは「郵便(定形、定形外、書留など)」（半角括弧）、
+  // 商品ページは「普通郵便（定形、定形外）」。レターパックは選択ページ
+  // では 1 本化されている。ゆうパケットポスト系はゆうゆう便の子方法。
+  const METHOD_CANONICAL = {
+    "郵便（定形、定形外、書留など）": "普通郵便（定形、定形外）",
+    "普通郵便": "普通郵便（定形、定形外）",
+    "レターパックプラス": "レターパック",
+    "レターパックライト": "レターパック",
+    "ゆうパケットポストmini": "ゆうゆうメルカリ便",
+    "ゆうパケットポスト": "ゆうゆうメルカリ便",
+  };
   function normalizeMercariMethod(text) {
     if (!text) return null;
-    const flat = String(text).replace(/\s+/g, "");
+    const flat = String(text).replace(/\s+/g, "").replace(/（/g, "(").replace(/）/g, ")");
     // 最も早く現れる語彙を採る。同位置で重なる名前（ゆうパケット /
     // ゆうパケットポスト / ゆうパケットポストmini）は最長を優先。
     // カード内には自方法名の後ろに子方法名も並ぶため、最長一致だけでは
@@ -89,7 +103,7 @@
     let bestIdx = Infinity;
     let bestLen = -1;
     for (const name of MERCARI_METHODS) {
-      const n = name.replace(/\s+/g, "");
+      const n = name.replace(/\s+/g, "").replace(/（/g, "(").replace(/）/g, ")");
       const idx = flat.indexOf(n);
       if (idx < 0) continue;
       if (idx < bestIdx || (idx === bestIdx && n.length > bestLen)) {
@@ -98,7 +112,7 @@
         bestLen = n.length;
       }
     }
-    if (best) return best;
+    if (best) return METHOD_CANONICAL[best] || best;
     // 語彙に無い名前（新設の方法など）は元の文字列をそのまま返す。
     return String(text).trim() || null;
   }

@@ -340,7 +340,12 @@
     if (!c) return false;
     const raw = normShip(c.textContent || "");
     if (!raw || raw.includes(normShip("配送の方法を選択する"))) return false;
-    return raw.includes(normShip(target));
+    if (raw.includes(normShip(target))) return true;
+    // 郵便はフォーム側の表示表記が選択ページと違うことがあるため別表記も見る。
+    if (target === "普通郵便（定形、定形外）") {
+      return raw.includes(normShip("郵便（定形、定形外、書留など）"));
+    }
+    return false;
   }
 
   // 配送の方法ページのラジオを探す。カードには方法名のほかに料金や
@@ -354,6 +359,7 @@
     "ゆうゆうメルカリ便",
     "レターパックプラス",
     "レターパックライト",
+    "郵便（定形、定形外、書留など）",
     "普通郵便（定形、定形外）",
     "たのメル便",
     "クロネコヤマト",
@@ -365,9 +371,22 @@
     "普通郵便",
     "未定",
   ];
+
+  // 選択ページの表記と商品ページの表記が違う方法の正規化。
+  // 郵便: 選択ページは「郵便(定形、定形外、書留など)」（半角括弧）、
+  // 商品ページは「普通郵便（定形、定形外）」。レターパックは選択ページ
+  // では 1 本化されている。ゆうパケットポスト系はゆうゆう便の子方法。
+  const METHOD_CANONICAL = {
+    "郵便（定形、定形外、書留など）": "普通郵便（定形、定形外）",
+    "普通郵便": "普通郵便（定形、定形外）",
+    "レターパックプラス": "レターパック",
+    "レターパックライト": "レターパック",
+    "ゆうパケットポストmini": "ゆうゆうメルカリ便",
+    "ゆうパケットポスト": "ゆうゆうメルカリ便",
+  };
   function mercariMethodVocabMatch(text) {
     if (!text) return null;
-    const flat = String(text).replace(/\s+/g, "");
+    const flat = String(text).replace(/\s+/g, "").replace(/（/g, "(").replace(/）/g, ")");
     // 最も早く現れる語彙を採る。同位置で重なる名前（ゆうパケット /
     // ゆうパケットポスト / ゆうパケットポストmini）は最長を優先。
     // カード内には自方法名の後ろに子方法名も並ぶため、最長一致だけでは
@@ -376,7 +395,7 @@
     let bestIdx = Infinity;
     let bestLen = -1;
     for (const name of MERCARI_METHODS) {
-      const n = name.replace(/\s+/g, "");
+      const n = name.replace(/\s+/g, "").replace(/（/g, "(").replace(/）/g, ")");
       const idx = flat.indexOf(n);
       if (idx < 0) continue;
       if (idx < bestIdx || (idx === bestIdx && n.length > bestLen)) {
@@ -385,7 +404,7 @@
         bestLen = n.length;
       }
     }
-    return best;
+    return best ? METHOD_CANONICAL[best] || best : null;
   }
 
   function findShippingMethodRadio(target) {
