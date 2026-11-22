@@ -81,9 +81,25 @@
   function normalizeMercariMethod(text) {
     if (!text) return null;
     const flat = String(text).replace(/\s+/g, "");
+    // 最も早く現れる語彙を採る。同位置で重なる名前（ゆうパケット /
+    // ゆうパケットポスト / ゆうパケットポストmini）は最長を優先。
+    // カード内には自方法名の後ろに子方法名も並ぶため、最長一致だけでは
+    // ゆうゆう便カードから ゆうパケットポストmini を誤って拾う。
+    let best = null;
+    let bestIdx = Infinity;
+    let bestLen = -1;
     for (const name of MERCARI_METHODS) {
-      if (flat.includes(name.replace(/\s+/g, ""))) return name;
+      const n = name.replace(/\s+/g, "");
+      const idx = flat.indexOf(n);
+      if (idx < 0) continue;
+      if (idx < bestIdx || (idx === bestIdx && n.length > bestLen)) {
+        best = name;
+        bestIdx = idx;
+        bestLen = n.length;
+      }
     }
+    if (best) return best;
+    // 語彙に無い名前（新設の方法など）は元の文字列をそのまま返す。
     return String(text).trim() || null;
   }
 
