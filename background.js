@@ -1042,14 +1042,21 @@ async function executeYahooManagerTask(cfg, task) {
 }
 
 // ============================================================
-// 自動下架タスク（v0.12.14）
+// 自動下架タスク（v0.12.14、Mercari は v0.12.26 で仕様変更）
 // プログラムの「自動下架」スイッチが ON のレコードについて、在庫より
 // 出品が多くなったときに余剰分を落とす。
-//   Mercari: 出品を「削除」する（停止ではない。ユーザーの確定仕様）。
+//   Mercari: 出品を「一時停止」する（2026-11-22 ユーザーが仕様変更。
+//            削除すると商品 ID が消え、次に売るとき辿れなくなるため。
+//            停止なら ID は残り、再開もできる）。結果は paused:true で
+//            返し、プログラム側は ID を保持したまま「一時停止」状態に
+//            する。補充は従来どおりコピー再出品（ユーザー確定）。
 //   Yahoo:   入札 0 件なら「取り消し」。入札があれば絶対に触らず、
 //            hasBids で返してプログラム側で手動対応に回す。
 // どちらも所有権ゲート必須・操作後の検証必須・fail-closed。
-// ページ側の導線は実機の犠牲テストで詰める前提の防御的実装。
+// Mercari の一時停止ボタンは編集ページ末尾にある（実ページで確認済:
+// 商品ページには無い）。押した後の確認モーダルの有無は未確認のため、
+// 確認ボタンが現れた場合だけ押し、成否は編集ページを開き直して
+// 「再開」ボタンの出現で検証する。
 // ============================================================
 
 function delistPostResultFactory(cfg, task) {
@@ -1063,6 +1070,7 @@ function delistPostResultFactory(cfg, task) {
           listingUrl: null,
           message: message || null,
           hasBids: !!(extra && extra.hasBids),
+          paused: !!(extra && extra.paused),
         }),
       });
     } catch (e) {
@@ -1126,9 +1134,10 @@ async function executeMercariDelistTask(cfg, task) {
     if (!toEdit) throw new Error("編集ボタンが見つかりませんでした");
     await waitForTabComplete(tabId, 45000);
     await remoteSleep(2500);
-    // 編集ページ末尾の「この出品を削除する」を押す（画像削除アイコン等と
-    // 誤認しないよう、文言が完全なものだけを対象にする）。
-    const delClicked = await chrome.scripting
+    // 編集ページ末尾の「出品を一時停止する」を押す。既に停止中なら
+    // 「出品を再開する」系のボタンに変わっているので、その場合は
+    // 何もせず成功（停止済み）として返す。
+    const pauseAction = await chrome.scripting
       .executeScript({
         target: { tabId },
         func: () => {
@@ -1137,22 +1146,28 @@ async function executeMercariDelistTask(cfg, task) {
             return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
           };
           const cands = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(visible);
-          const hit = cands.find((el) => {
-            const t = String(el.innerText || "").replace(/\s+/g, " ").trim();
-            return t === "この出品を削除する" || t === "出品を削除する";
-          });
-          if (!hit) return false;
-          hit.scrollIntoView({ block: "center" });
-          hit.click();
-          return true;
+          const texts = cands.map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim());
+          const pauseHit = cands[texts.indexOf("出品を一時停止する")];
+          if (pauseHit) {
+            pauseHit.scrollIntoView({ block: "center" });
+            pauseHit.click();
+            return "clicked";
+          }
+          if (texts.some((t) => t.includes("再開"))) return "already";
+          return "missing";
         },
       })
-      .then((r) => !!(r[0] && r[0].result))
-      .catch(() => false);
-    if (!delClicked) throw new Error("削除ボタン（この出品を削除する）が見つかりませんでした");
+      .then((r) => (r[0] && r[0].result) || "missing")
+      .catch(() => "missing");
+    if (pauseAction === "already") {
+      await postResult(true, "既に一時停止中でした: " + itemId, { paused: true });
+      return;
+    }
+    if (pauseAction !== "clicked") throw new Error("一時停止ボタン（出品を一時停止する）が見つかりませんでした");
     await remoteSleep(1800);
-    // 確認モーダルの「削除する」を押す（キャンセル側は絶対に押さない）。
-    const confirmed = await chrome.scripting
+    // 確認モーダルが出た場合だけ、その「一時停止する」を押す
+    // （キャンセル側は絶対に押さない）。モーダルが無ければ何もしない。
+    await chrome.scripting
       .executeScript({
         target: { tabId },
         func: () => {
@@ -1163,43 +1178,42 @@ async function executeMercariDelistTask(cfg, task) {
           const cands = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
           const hit = cands.find((el) => {
             const t = String(el.innerText || "").replace(/\s+/g, " ").trim();
-            return t === "削除する" || t === "この出品を削除する";
+            return t === "一時停止する" || t === "停止する";
           });
           if (!hit) return false;
           hit.click();
           return true;
         },
       })
-      .then((r) => !!(r[0] && r[0].result))
       .catch(() => false);
-    if (!confirmed) throw new Error("削除の確認ボタンが見つかりませんでした");
-    await remoteSleep(3000);
-    // 検証: 商品ページを開き直し、削除済みであることを確かめる。
-    await chrome.tabs.update(tabId, { url: task.itemUrl, active: true });
+    await remoteSleep(2000);
+    // 検証: 編集ページを開き直し、「再開」ボタンに変わっていて
+    // 「出品を一時停止する」が消えていることを確かめる。
+    await chrome.tabs.update(tabId, {
+      url: "https://jp.mercari.com/sell/edit/" + encodeURIComponent(itemId),
+      active: true,
+    });
     await waitForTabComplete(tabId, 45000);
     await remoteSleep(2500);
     const verified = await chrome.scripting
       .executeScript({
         target: { tabId },
         func: () => {
-          const text = String(document.body ? document.body.innerText || "" : "");
-          if (/削除されました|削除された商品|出品が削除/.test(text)) return true;
           const visible = (el) => {
             const s = getComputedStyle(el);
             return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
           };
           const cands = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(visible);
           const labels = cands.map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim());
-          const hasBuy = labels.some((t) => /購入手続き/.test(t));
-          const hasSeller = labels.some((t) => /商品の編集|出品を一時停止|編集する/.test(t));
-          // 購入も編集もできない = もう生きている出品ではない。
-          return !hasBuy && !hasSeller;
+          const hasResume = labels.some((t) => t.includes("再開"));
+          const hasPause = labels.some((t) => t === "出品を一時停止する");
+          return hasResume && !hasPause;
         },
       })
       .then((r) => !!(r[0] && r[0].result))
       .catch(() => false);
-    if (!verified) throw new Error("削除を確認できませんでした（商品ページがまだ有効です）");
-    await postResult(true, "出品を削除しました: " + itemId);
+    if (!verified) throw new Error("一時停止を確認できませんでした（編集ページが停止状態になっていません）");
+    await postResult(true, "出品を一時停止しました: " + itemId, { paused: true });
   } catch (e) {
     await postResult(false, String((e && e.message) || e));
   } finally {
