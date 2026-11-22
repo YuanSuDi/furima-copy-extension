@@ -343,8 +343,37 @@
     return raw.includes(normShip(target));
   }
 
-  // 配送の方法ページのラジオを探す。カード型のラジオはラベル全体の
-  // 1 行目が方法名（バッジ語を除く）。「その他」内の行は名前そのもの。
+  // 配送の方法ページのラジオを探す。カードには方法名のほかに料金や
+  // バッジ（匿名配送・追跡・補償・おすすめ）が混ざり、1 行目の完全一致
+  // では拾えないことがある（A351 v0.12.14 で未選択のまま失敗）。
+  // 語彙照合で「方法名らしい部分」を取り出して比べる。
+  const MERCARI_METHODS = [
+    "ゆうパケットポストmini",
+    "ゆうパケットポスト",
+    "らくらくメルカリ便",
+    "ゆうゆうメルカリ便",
+    "レターパックプラス",
+    "レターパックライト",
+    "普通郵便（定形、定形外）",
+    "たのメル便",
+    "クロネコヤマト",
+    "クリックポスト",
+    "ゆうパケット",
+    "レターパック",
+    "ゆうメール",
+    "ゆうパック",
+    "普通郵便",
+    "未定",
+  ];
+  function mercariMethodVocabMatch(text) {
+    if (!text) return null;
+    const flat = String(text).replace(/\s+/g, "");
+    for (const name of MERCARI_METHODS) {
+      if (flat.includes(name.replace(/\s+/g, ""))) return name;
+    }
+    return null;
+  }
+
   function findShippingMethodRadio(target) {
     const radios = Array.from(
       document.querySelectorAll('input[type="radio"]')
@@ -357,18 +386,25 @@
         .split("\n")
         .map((s) => s.trim())
         .filter(Boolean);
-      const first = (lines[0] || "").replace(/匿名|追跡|補償/g, "");
-      if (normShip(first) === target || normShip(lines.join("")) === target) {
-        return label || r;
+      for (const line of lines) {
+        const cleaned = line
+          .replace(/匿名配送|匿名|追跡|補償|おすすめ/g, "")
+          .trim();
+        if (cleaned && normShip(cleaned) === target) return label || r;
+        const hit = mercariMethodVocabMatch(line);
+        if (hit && normShip(hit) === target) return label || r;
       }
+      const whole = mercariMethodVocabMatch(card.textContent || "");
+      if (whole && normShip(whole) === target) return label || r;
     }
     return null;
   }
 
   async function pickMercariShippingMethod(methodName) {
-    const target = normShip(methodName);
+    // 読み取り値が補足行と連結した塊でも、語彙照合で方法名に直してから探す。
+    const target = normShip(mercariMethodVocabMatch(methodName) || methodName || "");
     if (!target) return false;
-    if (shippingMethodShown(methodName)) return true;
+    if (shippingMethodShown(target)) return true;
     const link = findPageLink("/sell/shipping_methods");
     if (link) {
       FF.clickLikeUser(link);
@@ -408,7 +444,7 @@
     );
     if (upd) FF.clickLikeUser(upd);
     const ok = await FF.waitFor(
-      () => shippingMethodShown(methodName),
+      () => shippingMethodShown(target),
       6000,
       250
     );
@@ -633,7 +669,11 @@
             (ship.parts.length ? ship.parts.join(" / ") + " / " : "") +
             "未設定: " +
             ship.missing.join(", ") +
-            (data.shippingText ? "（候補: " + data.shippingText + "）" : ""),
+            (ship.missing.some((mm) => mm.includes("配送の方法")) && data.shippingMethodName
+              ? "（方法候補: " + data.shippingMethodName + "）"
+              : data.shippingText
+                ? "（候補: " + data.shippingText + "）"
+                : ""),
         });
       }
     } else {

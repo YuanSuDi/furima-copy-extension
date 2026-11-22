@@ -56,6 +56,37 @@
     return raw.filter(Boolean);
   }
 
+  // Mercari の配送方法の語彙。商品ページの「配送の方法」セルには方法名の
+  // 後ろに受取方法などの補足行がぶら下がり、DOM 読み取りでは連結した
+  // 塊になることがある（A351: ゆうゆうメルカリ便+郵便局/コンビニ受取+
+  // 匿名配送）。語彙に照らして方法名だけを取り出す（最長一致）。
+  const MERCARI_METHODS = [
+    "ゆうパケットポストmini",
+    "ゆうパケットポスト",
+    "らくらくメルカリ便",
+    "ゆうゆうメルカリ便",
+    "レターパックプラス",
+    "レターパックライト",
+    "普通郵便（定形、定形外）",
+    "たのメル便",
+    "クロネコヤマト",
+    "クリックポスト",
+    "ゆうパケット",
+    "レターパック",
+    "ゆうメール",
+    "ゆうパック",
+    "普通郵便",
+    "未定",
+  ];
+  function normalizeMercariMethod(text) {
+    if (!text) return null;
+    const flat = String(text).replace(/\s+/g, "");
+    for (const name of MERCARI_METHODS) {
+      if (flat.includes(name.replace(/\s+/g, ""))) return name;
+    }
+    return String(text).trim() || null;
+  }
+
   function extractFromNextData() {
     const el = document.getElementById("__NEXT_DATA__");
     if (!el || !el.textContent) return null;
@@ -81,7 +112,7 @@
       categoryText: categoryFromItem(item),
       shippingText: shipping,
       shippingPayer: payer || null,
-      shippingMethodName: method || null,
+      shippingMethodName: method ? normalizeMercariMethod(method) : null,
     };
   }
 
@@ -192,8 +223,9 @@
       // v0.12.12: 配送の内訳を構造化して保持する（出品フォームの自動選択用）。
       shippingPayer:
         FC.dom.specValue(["配送料の負担"]) || specByLabelAny(["配送料の負担"]),
-      shippingMethodName:
-        FC.dom.specValue(["配送の方法"]) || specByLabelAny(["配送の方法"]),
+      shippingMethodName: normalizeMercariMethod(
+        FC.dom.specValue(["配送の方法"]) || specByLabelAny(["配送の方法"])
+      ),
       shipFrom:
         FC.dom.specValue(["発送元の地域"]) || specByLabelAny(["発送元の地域"]),
       shipDays:
