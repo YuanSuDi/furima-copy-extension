@@ -423,49 +423,36 @@
     return best ? METHOD_CANONICAL[best] || best : null;
   }
 
+  // 選択肢の実構造（ユーザーが開発者ツールで確認、2026-11-22）:
+  //   <fieldset class="group inputField">
+  //     <input type="radio" name="selectedShippingMethod" value="8">
+  //     <div><div><p>レターパック</p></div></div>
+  //   </fieldset>
+  // label では包まれておらず、input と名称は兄弟。行（fieldset/label/li）
+  // 単位でテキスト照合し、その行の input を返す。行が本当に見えている
+  // 場合だけ候補にする（折りたたみ中の中身を「見つけた」と誤認しない）。
   function findShippingMethodRadio(target) {
     const radios = Array.from(
       document.querySelectorAll('input[type="radio"]')
     );
     for (const r of radios) {
-      const label = r.closest("label");
-      // 折りたたまれた「その他」の中身は DOM にあっても見えていない。
-      // 見えない候補を「見つけた」と誤認すると展開ステップに進めず、
-      // 空振りのクリックで終わる（レターパック未選択の真因）。
-      // クリック対象が実際に見えている場合だけ候補にする。
-      const clickEl = label || r;
-      if (!isReallyVisible(clickEl)) continue;
-      const card = label || r.parentElement;
-      if (!card) continue;
-      const lines = String(card.textContent || "")
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      for (const line of lines) {
-        const cleaned = line
-          .replace(/匿名配送|匿名|追跡|補償|おすすめ/g, "")
-          .trim();
-        if (cleaned && normShip(cleaned) === target) return r;
-        const hit = mercariMethodVocabMatch(line);
-        if (hit && normShip(hit) === target) return r;
-      }
-      const whole = mercariMethodVocabMatch(card.textContent || "");
-      if (whole && normShip(whole) === target) return r;
+      const row = r.closest("fieldset, label, li") || r.parentElement;
+      if (!row || !isReallyVisible(row)) continue;
+      const name =
+        mercariMethodVocabMatch(row.textContent || "") ||
+        normShip((row.textContent || "").trim());
+      if (name === target) return r;
     }
-    // 「その他」側の行は label で包まれていないことがあるので、
-    // 名前と完全一致する要素の行コンテナも候補にする。
-    const rowEls = Array.from(
-      document.querySelectorAll("label, li, div, span")
+    // 名称要素から辿る保険（input が行の外にある場合）。
+    const nameEls = Array.from(
+      document.querySelectorAll("p, div, span, label, li")
     ).filter((el) => isReallyVisible(el));
-    for (const el of rowEls) {
+    for (const el of nameEls) {
       if (normShip(el.textContent || "") !== target) continue;
-      const row =
-        el.closest("label, li, [role='radio'], [role='option']") || el;
-      // 行の中にラジオ入力があれば、それ自体を返す（行テキスト側の
-      // クリックは隣の行にずれることがあるため、入力要素が確実）。
+      const row = el.closest("fieldset, label, li") || el;
       const inner =
         row.querySelector && row.querySelector('input[type="radio"]');
-      return inner || row;
+      return inner || el;
     }
     return null;
   }
@@ -475,6 +462,19 @@
   // 長さ制限で弾いてしまい、そもそも展開できていなかった（レターパック
   // 未選択の原因）。先頭が「その他」の最も短い要素を専用に探す。
   function findShippingOtherExpander() {
+    // 実ページの展開ボタン（data-testid で特定可能。ユーザーが
+    // コンソールで getElementById(...).click() の有効性を実証済み）。
+    const triggers = Array.from(
+      document.querySelectorAll(
+        'button[data-testid="shipping-service-trigger-button"]'
+      )
+    ).filter(
+      (el) =>
+        FF.isVisible(el) &&
+        el.getAttribute("aria-expanded") !== "true" &&
+        norm(el.textContent || "").startsWith("その他")
+    );
+    if (triggers.length) return triggers[0];
     const matched = Array.from(
       document.querySelectorAll('button, a, li, [role="button"], div, span')
     )
@@ -541,26 +541,40 @@
       await backToSellForm();
       return false;
     }
-    FF.clickLikeUser(hit);
-    if (hit.tagName === "INPUT") {
-      // 本当にチェックが入ったか必ず確認する。入っていなければ
-      // ラベル側のクリックに切り替えてもう一度試す。
-      const nowChecked = () => {
-        const el = findShippingMethodRadio(target);
-        return !!(el && el.checked);
-      };
-      let checkedOk = await FF.waitFor(nowChecked, 2500, 200);
-      if (!checkedOk) {
-        const label = hit.closest && hit.closest("label");
-        if (label) {
-          FF.clickLikeUser(label);
-          checkedOk = await FF.waitFor(nowChecked, 2500, 200);
-        }
+    // 押し方: 候補を順に試し、対象ラジオの checked が実際に入るまで
+    // 諦めない。checked は不可視の input でも読めるので確実に判定できる。
+    // 候補 = ヒット要素 → 行内の名称要素 → 行（fieldset）自体。
+    const radioChecked = () => {
+      for (const r of document.querySelectorAll('input[type="radio"]')) {
+        const row = r.closest("fieldset, label, li") || r.parentElement;
+        if (!row) continue;
+        const name =
+          mercariMethodVocabMatch(row.textContent || "") ||
+          normShip((row.textContent || "").trim());
+        if (name === target && r.checked) return true;
       }
-      if (!checkedOk) {
-        await backToSellForm();
-        return false;
+      return false;
+    };
+    if (!radioChecked()) {
+      const rowEl = hit.closest
+        ? hit.closest("fieldset, label, li")
+        : null;
+      const nameEl = rowEl
+        ? Array.from(rowEl.querySelectorAll("p, div, span")).find(
+            (el) => normShip(el.textContent || "") === target
+          )
+        : null;
+      const tries = [hit];
+      if (nameEl && nameEl !== hit) tries.push(nameEl);
+      if (rowEl && rowEl !== hit && rowEl !== nameEl) tries.push(rowEl);
+      for (const el of tries) {
+        FF.clickLikeUser(el);
+        if (await FF.waitFor(radioChecked, 1500, 150)) break;
       }
+    }
+    if (!radioChecked()) {
+      await backToSellForm();
+      return false;
     }
     const upd = await FF.waitFor(
       () => FF.findClickableByText("更新する"),
