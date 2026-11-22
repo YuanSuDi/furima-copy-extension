@@ -56,6 +56,14 @@
     if (Date.now() - (pending.at || 0) > 10 * 60 * 1000) return; // 古い指示は無視
     const segments = pending.segments.map((s) => String(s).trim()).filter(Boolean);
     const leaf = segments[segments.length - 1];
+    const savePending = async (patch) => {
+      pending = Object.assign({}, pending, patch);
+      try {
+        await chrome.storage.local.set({ [CATEGORY_PENDING_KEY]: pending });
+      } catch (e) {
+        /* noop */
+      }
+    };
     const fail = async (msg) => {
       try {
         await chrome.storage.local.remove(CATEGORY_PENDING_KEY);
@@ -65,73 +73,45 @@
       pickerNote("カテゴリの自動選択に失敗しました：" + msg + "（手動で選択してください）");
       console.warn("[FurimaCopy] yahoo category picker failed:", msg);
     };
-    try {
-      // キーワード検索の入力欄と「検 索」ボタンを、同じ塊の中から探す。
-      // ページ上部のサイト内検索と取り違えないよう、タイトルがプリフィル
-      // されている欄（＝カテゴリ検索）を最優先し、次にセレクトボックスを
-      // 同じ塊に持つものを選ぶ。
-      const pair = await FF.waitFor(() => {
-        const btns = Array.from(
-          document.querySelectorAll('button, input[type="submit"], input[type="button"]')
-        ).filter(
-          (b) => FF.isVisible(b) && FF.normalizeText(b.textContent || b.value || "") === "検索"
-        );
-        const found = [];
-        for (const b of btns) {
-          let box = b;
-          for (let i = 0; i < 6 && box; i++) {
-            box = box.parentElement;
-            if (!box) break;
-            const input = box.querySelector('input[type="text"], input:not([type])');
-            if (input && FF.isVisible(input)) {
-              found.push({ input, btn: b, box });
-              break;
-            }
-          }
+    // 候補ラベルのパス文字列 → セグメント列。
+    // 実ページの候補は「オークション > … > ケース（出品されている商品）」形式。
+    const normSegs = (text) =>
+      String(text || "")
+        .replace(/（?出品されている商品）?/g, "")
+        .split(">")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((s) => s !== "オークション" && s !== "オークショントップ");
+    const findHit = () => {
+      for (const lab of Array.from(document.querySelectorAll("label"))) {
+        const segs = normSegs(lab.textContent);
+        if (
+          segs.length === segments.length &&
+          segs.every((s, i) => s === segments[i])
+        ) {
+          const radio =
+            lab.querySelector('input[type="radio"]') ||
+            (lab.htmlFor ? document.getElementById(lab.htmlFor) : null);
+          if (radio) return { lab, radio };
         }
-        if (!found.length) return null;
-        const prefilled = found.find((f) => (f.input.value || "").trim().length > 0);
-        if (prefilled) return prefilled;
-        const withSelect = found.find((f) => f.box.querySelector("select"));
-        return withSelect || found[0];
-      }, 8000, 250);
-      if (!pair) return fail("カテゴリ検索欄が見つかりませんでした");
-      FF.setNativeValue(pair.input, leaf);
-      pair.input.dispatchEvent(new Event("change", { bubbles: true }));
-      FF.clickLikeUser(pair.btn);
-
-      // 結果ラジオ（パス表示）の中から、セグメント列が完全一致するものを探す。
-      const normSegs = (text) =>
-        String(text || "")
-          .replace(/（出品されている商品）/g, "")
-          .split(">")
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .filter((s) => s !== "オークション");
-      const hit = await FF.waitFor(() => {
-        for (const lab of Array.from(document.querySelectorAll("label"))) {
-          const segs = normSegs(lab.textContent);
-          if (
-            segs.length === segments.length &&
-            segs.every((s, i) => s === segments[i])
-          ) {
-            const radio =
-              lab.querySelector('input[type="radio"]') ||
-              (lab.htmlFor ? document.getElementById(lab.htmlFor) : null);
-            if (radio) return { lab, radio };
-          }
-        }
-        return null;
-      }, 12000, 300);
-      if (!hit) {
-        return fail("候補に一致するカテゴリがありませんでした（" + (pending.path || leaf) + "）");
       }
+      return null;
+    };
+    const hasResults = () =>
+      Array.from(document.querySelectorAll("label")).some((lab) =>
+        lab.querySelector('input[type="radio"]')
+      );
+    const labelsSignature = () =>
+      Array.from(document.querySelectorAll("label"))
+        .map((lab) => FF.normalizeText(lab.textContent || ""))
+        .join("|")
+        .slice(0, 400);
+    const selectHit = async (hit) => {
       FF.clickLikeUser(hit.lab);
       if (!hit.radio.checked) {
         try { hit.radio.click(); } catch (e) { /* 下で検証する */ }
       }
       if (!hit.radio.checked) return fail("カテゴリのラジオを選択できませんでした");
-
       const confirmBtn = await FF.waitFor(() => {
         const btns = Array.from(
           document.querySelectorAll('button, input[type="submit"], input[type="button"]')
@@ -146,6 +126,96 @@
       if (!confirmBtn) return fail("確定ボタン（このカテゴリに出品）が見つかりませんでした");
       FF.clickLikeUser(confirmBtn);
       // 成功時は保留データを残す。フォーム側が実際の選択と照合して消す。
+    };
+    try {
+      // まず現在表示中の候補から探す（検索済みの再実行・ページ遷移後の継続）。
+      let hit = findHit();
+      if (hit) return selectHit(hit);
+
+      if (!hasResults()) {
+        // キーワード検索の入力欄と「検 索」ボタンを、同じ塊の中から探す。
+        // ページ上部のサイト内検索と取り違えないよう、タイトルがプリフィル
+        // されている欄（＝カテゴリ検索）を最優先し、次にセレクトボックスを
+        // 同じ塊に持つものを選ぶ。
+        const pair = await FF.waitFor(() => {
+          const btns = Array.from(
+            document.querySelectorAll('button, input[type="submit"], input[type="button"]')
+          ).filter(
+            (b) => FF.isVisible(b) && FF.normalizeText(b.textContent || b.value || "") === "検索"
+          );
+          const found = [];
+          for (const b of btns) {
+            let box = b;
+            for (let i = 0; i < 6 && box; i++) {
+              box = box.parentElement;
+              if (!box) break;
+              const input = box.querySelector('input[type="text"], input:not([type])');
+              if (input && FF.isVisible(input)) {
+                found.push({ input, btn: b, box });
+                break;
+              }
+            }
+          }
+          if (!found.length) return null;
+          const prefilled = found.find((f) => (f.input.value || "").trim().length > 0);
+          if (prefilled) return prefilled;
+          const withSelect = found.find((f) => f.box.querySelector("select"));
+          return withSelect || found[0];
+        }, 8000, 250);
+        if (!pair) return fail("カテゴリ検索欄が見つかりませんでした");
+        // 候補を絞るため、大分類セレクトを先頭セグメントに合わせてから検索する
+        // （v0.12.27: 末端語だけだと 69 件など大量に出て 1 ページ目に載らない）。
+        const sel = pair.box.querySelector("select");
+        if (sel && segments.length > 1) {
+          const opt = Array.from(sel.options || []).find(
+            (o) => FF.normalizeText(o.textContent || "") === segments[0]
+          );
+          if (opt && sel.value !== opt.value) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("input", { bubbles: true }));
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        }
+        if ((pair.input.value || "").trim() !== leaf) {
+          FF.setNativeValue(pair.input, leaf);
+          pair.input.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        await savePending({ searched: true });
+        FF.clickLikeUser(pair.btn);
+        // 結果の出現を待つ。検索がページ遷移なら本実行はここで終わり、
+        // 遷移先で再実行されたドライバが表示中の候補から続きを拾う。
+        const ready = await FF.waitFor(() => (hasResults() ? true : null), 12000, 300);
+        if (!ready) {
+          if (pending.searched) {
+            return fail("候補に一致するカテゴリがありませんでした（" + (pending.path || leaf) + "）");
+          }
+          return; // 遷移中とみなし、次回実行に委ねる
+        }
+        hit = findHit();
+        if (hit) return selectHit(hit);
+      }
+
+      // 表示中の候補に無ければ「次の10件」でページを送りながら探す（最大10回）。
+      for (let i = 0; i < 10; i++) {
+        if ((pending.paged || 0) >= 10) break;
+        const next = Array.from(document.querySelectorAll("a, button")).find(
+          (a) => FF.isVisible(a) && FF.normalizeText(a.textContent || "") === "次の10件"
+        );
+        if (!next) break;
+        const beforeSig = labelsSignature();
+        await savePending({ paged: (pending.paged || 0) + 1 });
+        FF.clickLikeUser(next);
+        // AJAX 差し替えならラベル集合が変わる。ページ遷移なら再実行側が拾う。
+        const changed = await FF.waitFor(
+          () => (labelsSignature() !== beforeSig ? true : null),
+          6000,
+          300
+        );
+        if (!changed) break;
+        hit = findHit();
+        if (hit) return selectHit(hit);
+      }
+      return fail("候補に一致するカテゴリがありませんでした（" + (pending.path || leaf) + "）");
     } catch (e) {
       await fail(String((e && e.message) || e));
     }
