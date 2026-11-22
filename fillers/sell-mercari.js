@@ -430,7 +430,35 @@
       const whole = mercariMethodVocabMatch(card.textContent || "");
       if (whole && normShip(whole) === target) return label || r;
     }
+    // 「その他」側の行は label で包まれていないことがあるので、
+    // 名前と完全一致する要素の行コンテナも候補にする。
+    const rowEls = Array.from(
+      document.querySelectorAll("label, li, div, span")
+    ).filter((el) => FF.isVisible(el));
+    for (const el of rowEls) {
+      if (normShip(el.textContent || "") !== target) continue;
+      return (
+        el.closest("label, li, [role='radio'], [role='option']") || el
+      );
+    }
     return null;
+  }
+
+  // 「その他」展開行を探す。展開行のテキストは「その他 ゆうメール、
+  // レターパック、普通郵便…など」と長く、汎用の findClickableByText は
+  // 長さ制限で弾いてしまい、そもそも展開できていなかった（レターパック
+  // 未選択の原因）。先頭が「その他」の最も短い要素を専用に探す。
+  function findShippingOtherExpander() {
+    const cands = Array.from(
+      document.querySelectorAll('button, a, li, [role="button"], div')
+    ).filter((el) => FF.isVisible(el));
+    let best = null;
+    for (const el of cands) {
+      const t = norm(el.textContent || "");
+      if (!t.startsWith("その他") || t.length > 60) continue;
+      if (!best || t.length < norm(best.textContent || "").length) best = el;
+    }
+    return best;
   }
 
   async function pickMercariShippingMethod(methodName) {
@@ -464,7 +492,7 @@
       250
     );
     if (!hit && /shipping_methods/.test(location.pathname)) {
-      const expander = FF.findClickableByText("その他");
+      const expander = findShippingOtherExpander();
       if (expander) {
         FF.clickLikeUser(expander);
         hit = await FF.waitFor(
