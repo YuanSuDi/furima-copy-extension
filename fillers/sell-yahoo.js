@@ -11,7 +11,10 @@
 //     取れている場合に自動選択を試す（v0.12.6）
 //   - カテゴリは選択ページ（topsubmit）へ遷移して自動選択する（v0.12.6）:
 //     フォーム側で保留データを置いて「選択する」を押し、topsubmit 側の
-//     ドライバがキーワード検索で完全一致するパスを選んで確定する
+//     ドライバがパスを選んで確定する。主ルートは「リストから選択する」の
+//     ツリー逐次選択（v0.12.28、実測で確定した確実な経路）。キーワード
+//     検索＋完全一致はフォールバック（Yahoo! の検索索引に載らない
+//     カテゴリがあり、確率で失敗するため主ルートにしない）
 //   - 説明文は入力後に編集欄を読み戻し、文字数で検証してから OK とする
 // 送信・出品ボタンは絶対に押さない。
 (() => {
@@ -106,12 +109,7 @@
         .map((lab) => FF.normalizeText(lab.textContent || ""))
         .join("|")
         .slice(0, 400);
-    const selectHit = async (hit) => {
-      FF.clickLikeUser(hit.lab);
-      if (!hit.radio.checked) {
-        try { hit.radio.click(); } catch (e) { /* 下で検証する */ }
-      }
-      if (!hit.radio.checked) return fail("カテゴリのラジオを選択できませんでした");
+    const clickConfirmButton = async () => {
       const confirmBtn = await FF.waitFor(() => {
         const btns = Array.from(
           document.querySelectorAll('button, input[type="submit"], input[type="button"]')
@@ -123,14 +121,83 @@
         );
         return btns[0] || null;
       }, 6000, 250);
-      if (!confirmBtn) return fail("確定ボタン（このカテゴリに出品）が見つかりませんでした");
+      if (!confirmBtn) return false;
       FF.clickLikeUser(confirmBtn);
+      return true;
+    };
+    const selectHit = async (hit) => {
+      FF.clickLikeUser(hit.lab);
+      if (!hit.radio.checked) {
+        try { hit.radio.click(); } catch (e) { /* 下で検証する */ }
+      }
+      if (!hit.radio.checked) return fail("カテゴリのラジオを選択できませんでした");
+      if (!(await clickConfirmButton())) {
+        return fail("確定ボタン（このカテゴリに出品）が見つかりませんでした");
+      }
       // 成功時は保留データを残す。フォーム側が実際の選択と照合して消す。
     };
+    // ---- 主ルート: 「リストから選択する」のツリーをパス通り辿る（v0.12.28） ----
+    // 実測（2026-11-22）: 左→右に列が増える逐次展開 UI。子ありは右端に「>」、
+    // 一部カテゴリ名は末尾に「@」装飾。下部「選択したカテゴリ」に現在の
+    // パスが「>」連結で表示される。葉を押すと「このカテゴリに出品」が出る。
+    // キーワード検索は Yahoo! 側の索引に載らないカテゴリがあり確率で失敗
+    // するため、ツリーを主ルート、検索をフォールバックにする。
+    const cleanEntryText = (t) =>
+      FF.normalizeText(t || "").replace(/[>＞@]\s*$/g, "").trim();
+    const findTreeEntry = (name) => {
+      const cands = Array.from(
+        document.querySelectorAll('a, button, li, [role="button"], [role="option"]')
+      ).filter((el) => FF.isVisible(el) && cleanEntryText(el.textContent) === name);
+      return cands[0] || null;
+    };
+    const selectedPathShown = (upto) => {
+      const want = segments.slice(0, upto + 1).join(">");
+      const els = Array.from(document.querySelectorAll("div, p, span, td, dd, li"));
+      return els.some((el) => {
+        const t = FF.normalizeText(el.textContent || "").replace(/\s*>\s*/g, ">");
+        return t === want || t.endsWith(">" + want) || t.includes("選択したカテゴリ") && t.includes(want);
+      });
+    };
+    const drillDown = async () => {
+      const tab = await FF.waitFor(() => {
+        const tabs = Array.from(document.querySelectorAll('a, button, li, [role="tab"]')).filter(
+          (el) => FF.isVisible(el) && FF.normalizeText(el.textContent || "") === "リストから選択する"
+        );
+        return tabs[0] || null;
+      }, 8000, 250);
+      if (!tab) return false;
+      FF.clickLikeUser(tab);
+      for (let i = 0; i < segments.length; i++) {
+        const entry = await FF.waitFor(() => findTreeEntry(segments[i]), 9000, 300);
+        if (!entry) return false;
+        FF.clickLikeUser(entry);
+        // 効いていなければネイティブ click でもう一度だけ試す
+        const okPath = await FF.waitFor(
+          () => (selectedPathShown(i) ? true : null),
+          2500,
+          250
+        );
+        if (!okPath) {
+          try { entry.click(); } catch (e) { /* 次の検証に委ねる */ }
+          await FF.waitFor(() => (selectedPathShown(i) ? true : null), 2500, 250);
+        }
+      }
+      // 葉まで辿れたら確定ボタンが出るはず
+      return clickConfirmButton();
+    };
     try {
-      // まず現在表示中の候補から探す（検索済みの再実行・ページ遷移後の継続）。
+      // まず現在表示中の検索候補から探す（検索済みの再実行・遷移後の継続）。
       let hit = findHit();
       if (hit) return selectHit(hit);
+
+      // 主ルート: ツリー逐次選択
+      if (await drillDown()) return;
+      // ツリーで途中まで進んだ場合に備え、状態を検索モード側へ寄せ直すため
+      // キーワードタブへ戻ってからフォールバックする。
+      const kwTab = Array.from(document.querySelectorAll('a, button, li, [role="tab"]')).find(
+        (el) => FF.isVisible(el) && FF.normalizeText(el.textContent || "").startsWith("キーワードから選択する")
+      );
+      if (kwTab) FF.clickLikeUser(kwTab);
 
       if (!hasResults()) {
         // キーワード検索の入力欄と「検 索」ボタンを、同じ塊の中から探す。
@@ -163,19 +230,8 @@
           return withSelect || found[0];
         }, 8000, 250);
         if (!pair) return fail("カテゴリ検索欄が見つかりませんでした");
-        // 候補を絞るため、大分類セレクトを先頭セグメントに合わせてから検索する
-        // （v0.12.27: 末端語だけだと 69 件など大量に出て 1 ページ目に載らない）。
-        const sel = pair.box.querySelector("select");
-        if (sel && segments.length > 1) {
-          const opt = Array.from(sel.options || []).find(
-            (o) => FF.normalizeText(o.textContent || "") === segments[0]
-          );
-          if (opt && sel.value !== opt.value) {
-            sel.value = opt.value;
-            sel.dispatchEvent(new Event("input", { bubbles: true }));
-            sel.dispatchEvent(new Event("change", { bubbles: true }));
-          }
-        }
+        // 大分類セレクトは触らない（v0.12.27 の絞り込みは、索引に無い
+        // カテゴリを結果から消してしまう副作用が実測で判明したため廃止）。
         if ((pair.input.value || "").trim() !== leaf) {
           FF.setNativeValue(pair.input, leaf);
           pair.input.dispatchEvent(new Event("change", { bubbles: true }));
