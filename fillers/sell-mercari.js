@@ -435,7 +435,16 @@
 
   async function pickMercariShippingMethod(methodName) {
     // 読み取り値が補足行と連結した塊でも、語彙照合で方法名に直してから探す。
-    const target = normShip(mercariMethodVocabMatch(methodName) || methodName || "");
+    let resolved = mercariMethodVocabMatch(methodName);
+    if (!resolved && methodName) {
+      // 読み取りで方法名そのものが落ち、補足行だけが残った場合の救済。
+      // 持込ネットワークは便ごとに排他（郵便局=ゆうゆう便、
+      // セブン+ファミマ=らくらく便）なので、そこから一意に決まる。
+      if (/郵便局/.test(methodName)) resolved = "ゆうゆうメルカリ便";
+      else if (/セブン-イレブン/.test(methodName) && /ファミリーマート/.test(methodName))
+        resolved = "らくらくメルカリ便";
+    }
+    const target = normShip(resolved || methodName || "");
     if (!target) return false;
     if (shippingMethodShown(target)) return true;
     const link = findPageLink("/sell/shipping_methods");

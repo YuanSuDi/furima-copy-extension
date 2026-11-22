@@ -230,6 +230,37 @@
     return null;
   }
 
+  // ラベル行の「全文からラベルを除いた文字列」を返す。配送の方法では
+  // 方法名が子要素を持つ要素の直下テキストになっていて、末端要素だけを
+  // 集める specByLabelAny では方法名が落ち、補足行（郵便局/コンビニ受取
+  // 匿名配送）だけが残ることがある（A351 v0.12.17 で実証）。全文なら
+  // 方法名を含むので、語彙照合で取り出せる。
+  function specRowFullText(labels) {
+    const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const els = document.querySelectorAll(
+      "div, span, p, li, dt, th, td, label, h2, h3"
+    );
+    for (const el of els) {
+      const t = norm(el.textContent);
+      if (!t) continue;
+      const label = labels.find((l) => t === l || t === l + "：" || t === l + ":");
+      if (!label) continue;
+      let node = el;
+      for (let i = 0; i < 4 && node; i++) {
+        node = node.parentElement;
+        if (!node) break;
+        const full = norm(node.textContent);
+        if (full.length > label.length && full.length < 300) {
+          const v = full.replace(label, "").replace(/^[：:]/, "").trim();
+          if (v) return v;
+        }
+      }
+      const next = el.nextElementSibling;
+      if (next && norm(next.textContent)) return norm(next.textContent);
+    }
+    return null;
+  }
+
   function extractFromDom() {
     const imgs = [];
     document
@@ -254,7 +285,9 @@
       shippingPayer:
         FC.dom.specValue(["配送料の負担"]) || specByLabelAny(["配送料の負担"]),
       shippingMethodName: normalizeMercariMethod(
-        FC.dom.specValue(["配送の方法"]) || specByLabelAny(["配送の方法"])
+        FC.dom.specValue(["配送の方法"]) ||
+          specRowFullText(["配送の方法"]) ||
+          specByLabelAny(["配送の方法"])
       ),
       shipFrom:
         FC.dom.specValue(["発送元の地域"]) || specByLabelAny(["発送元の地域"]),
