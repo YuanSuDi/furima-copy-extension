@@ -429,12 +429,12 @@
         const cleaned = line
           .replace(/匿名配送|匿名|追跡|補償|おすすめ/g, "")
           .trim();
-        if (cleaned && normShip(cleaned) === target) return label || r;
+        if (cleaned && normShip(cleaned) === target) return r;
         const hit = mercariMethodVocabMatch(line);
-        if (hit && normShip(hit) === target) return label || r;
+        if (hit && normShip(hit) === target) return r;
       }
       const whole = mercariMethodVocabMatch(card.textContent || "");
-      if (whole && normShip(whole) === target) return label || r;
+      if (whole && normShip(whole) === target) return r;
     }
     // 「その他」側の行は label で包まれていないことがあるので、
     // 名前と完全一致する要素の行コンテナも候補にする。
@@ -443,9 +443,13 @@
     ).filter((el) => FF.isVisible(el));
     for (const el of rowEls) {
       if (normShip(el.textContent || "") !== target) continue;
-      return (
-        el.closest("label, li, [role='radio'], [role='option']") || el
-      );
+      const row =
+        el.closest("label, li, [role='radio'], [role='option']") || el;
+      // 行の中にラジオ入力があれば、それ自体を返す（行テキスト側の
+      // クリックは隣の行にずれることがあるため、入力要素が確実）。
+      const inner =
+        row.querySelector && row.querySelector('input[type="radio"]');
+      return inner || row;
     }
     return null;
   }
@@ -513,6 +517,26 @@
       return false;
     }
     FF.clickLikeUser(hit);
+    if (hit.tagName === "INPUT") {
+      // 本当にチェックが入ったか必ず確認する。入っていなければ
+      // ラベル側のクリックに切り替えてもう一度試す。
+      const nowChecked = () => {
+        const el = findShippingMethodRadio(target);
+        return !!(el && el.checked);
+      };
+      let checkedOk = await FF.waitFor(nowChecked, 2500, 200);
+      if (!checkedOk) {
+        const label = hit.closest && hit.closest("label");
+        if (label) {
+          FF.clickLikeUser(label);
+          checkedOk = await FF.waitFor(nowChecked, 2500, 200);
+        }
+      }
+      if (!checkedOk) {
+        await backToSellForm();
+        return false;
+      }
+    }
     const upd = await FF.waitFor(
       () => FF.findClickableByText("更新する"),
       4000,
