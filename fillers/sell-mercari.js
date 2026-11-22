@@ -410,9 +410,15 @@
   function findShippingMethodRadio(target) {
     const radios = Array.from(
       document.querySelectorAll('input[type="radio"]')
-    ).filter((el) => FF.isVisible(el) || el.closest("label"));
+    );
     for (const r of radios) {
       const label = r.closest("label");
+      // 折りたたまれた「その他」の中身は DOM にあっても見えていない。
+      // 見えない候補を「見つけた」と誤認すると展開ステップに進めず、
+      // 空振りのクリックで終わる（レターパック未選択の真因）。
+      // クリック対象が実際に見えている場合だけ候補にする。
+      const clickEl = label || r;
+      if (!FF.isVisible(clickEl)) continue;
       const card = label || r.parentElement;
       if (!card) continue;
       const lines = String(card.textContent || "")
