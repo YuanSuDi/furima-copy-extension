@@ -641,7 +641,7 @@
 
     // 画像（単体ファイル入力が複数ある前提で配布される）
     if (data.imageUrls && data.imageUrls.length) {
-      const r = await FF.attachImages(data.imageUrls);
+      const r = await FF.attachImages(data.imageUrls, { incremental: true });
       lines.push({
         label: "画像",
         status: r.attached ? "ok" : "fail",
