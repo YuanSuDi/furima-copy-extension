@@ -496,6 +496,20 @@
     return best;
   }
 
+  // グループ展開: 合成イベントで開かなければ、要素自体の click()
+  // （ユーザーがコンソールで実証した方法）に切り替える。
+  async function expandShippingGroup(ex, target) {
+    const opened = () =>
+      ex.getAttribute("aria-expanded") === "true" ||
+      !!findShippingMethodRadio(target);
+    FF.clickLikeUser(ex);
+    if (await FF.waitFor(opened, 1200, 200)) return true;
+    try {
+      ex.click();
+    } catch (e) {}
+    return !!(await FF.waitFor(opened, 2000, 200));
+  }
+
   async function pickMercariShippingMethod(methodName) {
     // 読み取り値が補足行と連結した塊でも、語彙照合で方法名に直してから探す。
     let resolved = mercariMethodVocabMatch(methodName);
@@ -521,6 +535,25 @@
       if (!trigger || !isSafeTrigger(trigger)) return false;
       FF.clickLikeUser(trigger);
     }
+    // 「その他」組の方法は、展開してからでないと押せない（ユーザー指摘）。
+    // 対象がその他組なら、探す前に必ず「その他」を展開する。
+    const OTHER_METHODS = [
+      "ゆうメール",
+      "レターパック",
+      "普通郵便（定形、定形外）",
+      "クロネコヤマト",
+      "ゆうパック",
+      "クリックポスト",
+      "ゆうパケット",
+      "未定",
+    ];
+    if (
+      /shipping_methods/.test(location.pathname) &&
+      OTHER_METHODS.includes(target)
+    ) {
+      const ex = findShippingOtherExpander();
+      if (ex) await expandShippingGroup(ex, target);
+    }
     let hit = await FF.waitFor(
       () => findShippingMethodRadio(target),
       8000,
@@ -529,7 +562,7 @@
     if (!hit && /shipping_methods/.test(location.pathname)) {
       const expander = findShippingOtherExpander();
       if (expander) {
-        FF.clickLikeUser(expander);
+        await expandShippingGroup(expander, target);
         hit = await FF.waitFor(
           () => findShippingMethodRadio(target),
           4000,
@@ -570,6 +603,13 @@
       for (const el of tries) {
         FF.clickLikeUser(el);
         if (await FF.waitFor(radioChecked, 1500, 150)) break;
+        // 合成イベントで入らなければ要素自体の click() も試す。
+        if (el.tagName === "INPUT") {
+          try {
+            el.click();
+          } catch (e) {}
+          if (await FF.waitFor(radioChecked, 1500, 150)) break;
+        }
       }
     }
     if (!radioChecked()) {
