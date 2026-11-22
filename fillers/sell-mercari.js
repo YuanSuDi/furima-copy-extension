@@ -335,6 +335,22 @@
     return selectValueOk(labelTexts, valueText);
   }
 
+  // FF.isVisible はレイアウト寸法しか見ないため、高さ 0 のコンテナに
+  // 折りたたまれた要素（寸法だけは残る）も「見える」と判定してしまう。
+  // 中心点を elementFromPoint で突き合わせ、最前面に本当に現れている
+  // 要素だけを可視とする（v0.12.20 の可視ゲートの強化）。
+  function isReallyVisible(el) {
+    if (!el || !FF.isVisible(el)) return false;
+    const rect = el.getBoundingClientRect();
+    if (!rect || rect.width === 0 || rect.height === 0) return false;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight)
+      return false;
+    const top = document.elementFromPoint(cx, cy);
+    return !!top && (top === el || el.contains(top) || top.contains(el));
+  }
+
   function shippingMethodShown(target) {
     const c = FF.fieldContainer(["配送の方法"]);
     if (!c) return false;
@@ -418,7 +434,7 @@
       // 空振りのクリックで終わる（レターパック未選択の真因）。
       // クリック対象が実際に見えている場合だけ候補にする。
       const clickEl = label || r;
-      if (!FF.isVisible(clickEl)) continue;
+      if (!isReallyVisible(clickEl)) continue;
       const card = label || r.parentElement;
       if (!card) continue;
       const lines = String(card.textContent || "")
@@ -440,7 +456,7 @@
     // 名前と完全一致する要素の行コンテナも候補にする。
     const rowEls = Array.from(
       document.querySelectorAll("label, li, div, span")
-    ).filter((el) => FF.isVisible(el));
+    ).filter((el) => isReallyVisible(el));
     for (const el of rowEls) {
       if (normShip(el.textContent || "") !== target) continue;
       const row =
@@ -459,14 +475,23 @@
   // 長さ制限で弾いてしまい、そもそも展開できていなかった（レターパック
   // 未選択の原因）。先頭が「その他」の最も短い要素を専用に探す。
   function findShippingOtherExpander() {
-    const cands = Array.from(
-      document.querySelectorAll('button, a, li, [role="button"], div')
-    ).filter((el) => FF.isVisible(el));
+    const matched = Array.from(
+      document.querySelectorAll('button, a, li, [role="button"], div, span')
+    )
+      .filter((el) => FF.isVisible(el))
+      .filter((el) => {
+        const t = norm(el.textContent || "");
+        return t.startsWith("その他") && t.length <= 60;
+      });
+    // 親コンテナを掴むとクリックがボタンに届かない（イベントは上にしか
+    // 伝播しない）。候補を内包する候補は落とし、最も深い要素を選ぶ。
+    const deepest = matched.filter(
+      (el) => !matched.some((other) => other !== el && el.contains(other))
+    );
     let best = null;
-    for (const el of cands) {
+    for (const el of deepest) {
       const t = norm(el.textContent || "");
-      if (!t.startsWith("その他") || t.length > 60) continue;
-      if (!best || t.length < norm(best.textContent || "").length) best = el;
+      if (!best || t.length <= norm(best.textContent || "").length) best = el;
     }
     return best;
   }
