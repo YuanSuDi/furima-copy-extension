@@ -429,32 +429,27 @@
   //     <div><div><p>レターパック</p></div></div>
   //   </fieldset>
   // label では包まれておらず、input と名称は兄弟。行（fieldset/label/li）
-  // 単位でテキスト照合し、その行の input を返す。行が本当に見えている
-  // 場合だけ候補にする（折りたたみ中の中身を「見つけた」と誤認しない）。
+  // 単位でテキスト照合し、その行の input を返す。見えている行を優先し、
+  // 無ければ不可視の input も最後の手段として返す（click() は不可視でも
+  // 効くことをユーザーがコンソールで実証: checked=true）。
   function findShippingMethodRadio(target) {
     const radios = Array.from(
-      document.querySelectorAll('input[type="radio"]')
+      document.querySelectorAll(
+        'input[name="selectedShippingMethod"], input[type="radio"]'
+      )
     );
+    let hiddenHit = null;
     for (const r of radios) {
       const row = r.closest("fieldset, label, li") || r.parentElement;
-      if (!row || !isReallyVisible(row)) continue;
+      if (!row) continue;
       const name =
         mercariMethodVocabMatch(row.textContent || "") ||
         normShip((row.textContent || "").trim());
-      if (name === target) return r;
+      if (name !== target) continue;
+      if (isReallyVisible(row)) return r;
+      if (!hiddenHit) hiddenHit = r;
     }
-    // 名称要素から辿る保険（input が行の外にある場合）。
-    const nameEls = Array.from(
-      document.querySelectorAll("p, div, span, label, li")
-    ).filter((el) => isReallyVisible(el));
-    for (const el of nameEls) {
-      if (normShip(el.textContent || "") !== target) continue;
-      const row = el.closest("fieldset, label, li") || el;
-      const inner =
-        row.querySelector && row.querySelector('input[type="radio"]');
-      return inner || el;
-    }
-    return null;
+    return hiddenHit;
   }
 
   // 「その他」展開行を探す。展開行のテキストは「その他 ゆうメール、
@@ -499,9 +494,13 @@
   // グループ展開: 合成イベントで開かなければ、要素自体の click()
   // （ユーザーがコンソールで実証した方法）に切り替える。
   async function expandShippingGroup(ex, target) {
-    const opened = () =>
-      ex.getAttribute("aria-expanded") === "true" ||
-      !!findShippingMethodRadio(target);
+    const opened = () => {
+      if (ex.getAttribute("aria-expanded") === "true") return true;
+      const h = findShippingMethodRadio(target);
+      if (!h) return false;
+      const row = h.closest("fieldset, label, li") || h.parentElement;
+      return !!row && isReallyVisible(row);
+    };
     FF.clickLikeUser(ex);
     if (await FF.waitFor(opened, 1200, 200)) return true;
     try {
@@ -554,29 +553,30 @@
       const ex = findShippingOtherExpander();
       if (ex) await expandShippingGroup(ex, target);
     }
-    let hit = await FF.waitFor(
-      () => findShippingMethodRadio(target),
-      8000,
-      250
-    );
+    const visibleHit = () => {
+      const h = findShippingMethodRadio(target);
+      if (!h) return null;
+      const row = h.closest("fieldset, label, li") || h.parentElement;
+      return row && isReallyVisible(row) ? h : null;
+    };
+    let hit = await FF.waitFor(visibleHit, 8000, 250);
     if (!hit && /shipping_methods/.test(location.pathname)) {
       const expander = findShippingOtherExpander();
       if (expander) {
         await expandShippingGroup(expander, target);
-        hit = await FF.waitFor(
-          () => findShippingMethodRadio(target),
-          4000,
-          250
-        );
+        hit = await FF.waitFor(visibleHit, 4000, 250);
       }
     }
+    // 最後の手段: 不可視でも input があれば使う。
+    if (!hit) hit = findShippingMethodRadio(target);
     if (!hit) {
       await backToSellForm();
       return false;
     }
-    // 押し方: 候補を順に試し、対象ラジオの checked が実際に入るまで
-    // 諦めない。checked は不可視の input でも読めるので確実に判定できる。
-    // 候補 = ヒット要素 → 行内の名称要素 → 行（fieldset）自体。
+    // 押し方: まず input 自体の click()（コンソールで checked=true を
+    // 実証済み）。合成イベントの dispatch ではラジオは切り替わらない
+    // ので、clickLikeUser は保険に回す。checked が実際に入るまで
+    // 諦めない。
     const radioChecked = () => {
       for (const r of document.querySelectorAll('input[type="radio"]')) {
         const row = r.closest("fieldset, label, li") || r.parentElement;
@@ -589,6 +589,12 @@
       return false;
     };
     if (!radioChecked()) {
+      try {
+        hit.click();
+      } catch (e) {}
+      await FF.waitFor(radioChecked, 2000, 150);
+    }
+    if (!radioChecked()) {
       const rowEl = hit.closest
         ? hit.closest("fieldset, label, li")
         : null;
@@ -597,19 +603,12 @@
             (el) => normShip(el.textContent || "") === target
           )
         : null;
-      const tries = [hit];
-      if (nameEl && nameEl !== hit) tries.push(nameEl);
-      if (rowEl && rowEl !== hit && rowEl !== nameEl) tries.push(rowEl);
+      const tries = [];
+      if (nameEl) tries.push(nameEl);
+      if (rowEl) tries.push(rowEl);
       for (const el of tries) {
         FF.clickLikeUser(el);
         if (await FF.waitFor(radioChecked, 1500, 150)) break;
-        // 合成イベントで入らなければ要素自体の click() も試す。
-        if (el.tagName === "INPUT") {
-          try {
-            el.click();
-          } catch (e) {}
-          if (await FF.waitFor(radioChecked, 1500, 150)) break;
-        }
       }
     }
     if (!radioChecked()) {
