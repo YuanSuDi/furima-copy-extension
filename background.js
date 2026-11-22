@@ -75,6 +75,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   (async () => {
+    imageFetchInFlight++;
+    lastImageFetchAt = Date.now();
     try {
       // Referer の第一候補はメッセージで渡されたコピー元 URL、なければ送信元タブの URL。
       const referrer = message.referrer || (sender.tab && sender.tab.url) || null;
@@ -89,6 +91,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     } catch (e) {
       console.warn("[FurimaCopy] image fetch failed:", message.url, e);
       sendResponse({ ok: false, error: String((e && e.message) || e) });
+    } finally {
+      imageFetchInFlight--;
+      lastImageFetchAt = Date.now();
     }
   })();
   return true; // 非同期で sendResponse するので true を返す
@@ -436,6 +441,9 @@ const MANAGER_SELL_URLS = {
 let managerRunning = false;
 let soldScanRunning = false;
 let yahooScanRunning = false;
+// 画像取込プロキシの活動量（自動更新の空き判定に使う、v0.12.30）
+let imageFetchInFlight = 0;
+let lastImageFetchAt = 0;
 
 async function getManagerConfig() {
   const res = await chrome.storage.local.get("managerConfig");
@@ -1372,6 +1380,67 @@ async function executeYahooDelistTask(cfg, task) {
   }
 }
 
+// ---- 同梱拡張の自動更新（v0.12.30） --------------------------------------
+// 管理プログラム（v0.2.18+）は同梱した拡張を実フォルダへ配置し、ポーリング
+// 応答の extVersion で「配置済みの版」を知らせる。自版より新しく、かつ
+// タスク実行・リモート指令・再出品・スキャン・画像取込のどれも動いて
+// いないときだけ chrome.runtime.reload() で読み直す（開いている出品
+// フォームのタブは従来どおりページ更新まで旧スクリプトのまま）。
+// 読み直しても版が上がらない場合に備え、同一版への試行は 10 分間隔で
+// 最大 3 回まで（chrome.storage.local に記録し、SW 再起動をまたぐ）。
+function compareVersions(a, b) {
+  const pa = String(a || "").split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || "").split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+const EXT_UPDATE_KEY = "fcExtAutoUpdate";
+
+async function maybeAutoUpdateExtension(serverVersion) {
+  try {
+    if (!serverVersion) return;
+    const own = chrome.runtime.getManifest().version;
+    if (compareVersions(serverVersion, own) <= 0) return;
+    if (
+      managerRunning ||
+      remoteRunning ||
+      yahooRelistRun ||
+      soldScanRunning ||
+      yahooScanRunning ||
+      imageFetchInFlight > 0 ||
+      Date.now() - lastImageFetchAt < 60 * 1000
+    ) {
+      return; // 仕事中は読み直さない。次回ポーリングで再挑戦する
+    }
+    const res = await chrome.storage.local.get(EXT_UPDATE_KEY);
+    const st = res[EXT_UPDATE_KEY] || {};
+    const now = Date.now();
+    const sameTarget = st.target === serverVersion;
+    if (sameTarget) {
+      if ((st.attempts || 0) >= 3) return;
+      if (now - (st.lastAt || 0) < 10 * 60 * 1000) return;
+    }
+    await chrome.storage.local.set({
+      [EXT_UPDATE_KEY]: {
+        target: serverVersion,
+        attempts: sameTarget ? (st.attempts || 0) + 1 : 1,
+        lastAt: now,
+      },
+    });
+    await setManagerConfig({
+      lastStatus: "拡張を自動更新します: v" + own + " → v" + serverVersion,
+    });
+    console.log("[FurimaCopy] auto-updating extension", own, "->", serverVersion);
+    chrome.runtime.reload();
+  } catch (e) {
+    console.warn("[FurimaCopy] auto-update check failed", e);
+  }
+}
+
 async function pollManagerTasks(why) {
   const cfg = await getManagerConfig();
   if (!cfg.enabled || managerRunning) return;
@@ -1395,6 +1464,7 @@ async function pollManagerTasks(why) {
   );
   if (!task) {
     await setManagerConfig({ lastStatus: "待機中（タスクなし） " + (why || "") });
+    await maybeAutoUpdateExtension(data.extVersion);
     return;
   }
   managerRunning = true;
@@ -1410,6 +1480,7 @@ async function pollManagerTasks(why) {
   } finally {
     managerRunning = false;
   }
+  await maybeAutoUpdateExtension(data.extVersion);
 }
 
 async function executeManagerTask(cfg, task) {
